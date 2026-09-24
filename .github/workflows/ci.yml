@@ -1,0 +1,53 @@
+name: CI
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ['3.12', '3.13']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: '0.8.23'
+      - name: Scan public files
+        run: python tools/check_public.py
+      - name: Install package and pinned dependency
+        run: uv sync --locked --python ${{ matrix.python }}
+      - name: Isolated package and installer tests
+        run: uv run --locked python -m unittest discover -s tests -v
+      - name: Decision regressions
+        run: uv run --locked python tools/test_core.py
+      - name: Build distribution
+        run: uv build
+      - name: Parse PowerShell resources
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          Get-ChildItem src -Recurse -Filter *.ps1 | ForEach-Object {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors)
+            if ($errors.Count) { throw "PowerShell parse failure: $($_.Name): $errors" }
+          }
+      - name: Compile menu bar
+        if: runner.os == 'macOS'
+        run: swiftc src/ccpick_app/legacy/autoswitch/menubar-main.swift -o "$RUNNER_TEMP/ccpick-menubar" -framework Cocoa
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan committed history
+        run: docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.30.1 git /repo --redact --no-banner

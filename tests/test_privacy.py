@@ -64,13 +64,23 @@ class PublicPrivacyTests(unittest.TestCase):
         self.write("README.md", "C:" + "\\Users\\" + "personal-user" + "\\bin")
         self.assertEqual(CHECK.check_tree(self.root), ["README.md:1: personal home path"])
 
-    def test_local_state_filenames_and_excluded_modules(self) -> None:
+    def test_local_state_filenames(self) -> None:
         for name in ("nested/account-status.json", "capture.jsonl", "credentials/data.txt",
-                     "auth.json", ".env.local", "ccpick_cdp.py", "auto_authorize.ps1"):
+                     "auth.json", ".env.local"):
             self.write(name)
         findings = CHECK.check_tree(self.root)
-        self.assertEqual(len(findings), 7)
+        self.assertEqual(len(findings), 5)
         self.assertTrue(all(":1: " in finding for finding in findings))
+
+    def test_authorization_source_is_allowed_but_private_data_is_not(self) -> None:
+        for name in ("ccpick_auto_authorize.py", "ccpick_cdp.py", "ccpick_js_gate.py",
+                     "auto_authorize.ps1"):
+            self.write("src/legacy/" + name, "# Public authorization implementation\n")
+        self.assertEqual(CHECK.check_tree(self.root), [])
+        private = "person" + "@" + "company.invalid"
+        self.write("src/legacy/ccpick_cdp.py", "# " + private)
+        self.assertEqual(CHECK.check_tree(self.root),
+                         ["src/legacy/ccpick_cdp.py:1: non-example email"])
 
     def test_secrets_are_reported_without_the_value(self) -> None:
         secret = "sk-" + "ant-" + "X" * 28

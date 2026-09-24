@@ -199,6 +199,104 @@ def switch_and_verify(cswap: str, email: str, timeout_s: int=25) -> tuple[bool, 
         time.sleep(1)
     return (False, '切换命令成功了，但 %.0f 秒内采样 %d 次，claude 报的身份仍是 %r（单次 auth status 最慢 %.1fs）' % (time.time() - t0, polls, last, worst))
 
+def autopilot(profile_dir: str, email: str, timeout_s: int=240, *, headless: bool=False, user_agent: str | None=None, max_attempts: int=6, cdp_context: dict | None=None) -> tuple[bool, str]:
+    here = Path(__file__).resolve().parent
+    cdp_unavailable = ''
+    try:
+        from ccpick import chrome_binary, chrome_user_data_dir
+        from ccpick_cdp import backend_status, run_authorization
+        existing_pipe = cdp_context.get('pipe') if cdp_context is not None else None
+        if existing_pipe is not None and (not existing_pipe.alive):
+            return (False, '[flow-failure] 批处理 CDP Chrome 已提前退出；拒绝中途改用 AppleScript/UIA 或另起实例')
+        if existing_pipe is not None:
+            cdp_ready, cdp_why = (True, 'CDP pipe（复用本批次 Chrome）')
+        else:
+            cdp_ready, cdp_why = backend_status(chrome_binary(), chrome_user_data_dir())
+        if cdp_ready:
+            if timeout_s == 0:
+                return (True, cdp_why)
+            exe = chrome_binary()
+            if not exe:
+                cdp_unavailable = 'CDP pipe 不可用：找不到 Chrome 可执行文件'
+            else:
+                ok, detail = run_authorization(exe, profile_dir, email, timeout_s=timeout_s, headless=headless, user_agent=user_agent, max_attempts=max_attempts, config_dir=os.environ.get('CLAUDE_CONFIG_DIR'), batch_context=cdp_context)
+                if cdp_context is not None and cdp_context.get('pipe') is not None:
+                    return (ok, '[backend=cdp] ' + detail)
+                if not detail.startswith('[cdp-unavailable]'):
+                    return (ok, '[backend=cdp] ' + detail)
+                cdp_unavailable = detail
+        else:
+            cdp_unavailable = cdp_why
+    except Exception as e:
+        if cdp_context is not None and cdp_context.get('pipe') is not None:
+            return (False, '[backend=cdp] [flow-failure] 批处理 CDP 状态异常（%s）；拒绝中途改用 AppleScript/UIA\n[auto] 阶段计数: signin=0 google=0 confirm=0 authorize=0' % type(e).__name__)
+        cdp_unavailable = 'CDP pipe 探测失败（%s）' % type(e).__name__
+    if headless or user_agent:
+        return (False, '[flow-failure] %s；请完全退出 Chrome 后重试 CDP' % cdp_unavailable)
+    if sys.platform == 'win32':
+        if timeout_s == 0:
+            return (True, '本平台没有额外的逐 profile 自动化前置条件')
+        ps1 = here / 'auto_authorize.ps1'
+        if not ps1.is_file():
+            return (False, '找不到 auto_authorize.ps1')
+        argv = [_runtime.powershell_path(), '-WindowStyle', 'Hidden', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(ps1), '-Profile', profile_dir, '-Email', email, '-TimeoutSec', str(timeout_s), '-NoAdd', '-CcpickLauncher', _runtime.launcher_path() or '']
+        config_dir = os.environ.get('CLAUDE_CONFIG_DIR')
+        if config_dir:
+            argv += ['-ConfigDir', config_dir]
+        rc, out, err = _run(argv, timeout=timeout_s + 120)
+        full = (out or err).strip()
+        detail = full[-600:]
+        refused = '★授权被拒★' in full
+        zero_click = 'signin=False(0次)' in full and 'google=False(0次)' in full and ('consent=0次' in full) and ('authorize=False(0次)' in full)
+        if refused and zero_click:
+            return (False, '[account-refusal] ' + detail)
+        if refused:
+            return (False, '[flow-failure] ' + detail)
+        return (rc == 0, detail)
+    if sys.platform == 'darwin':
+        if timeout_s == 0:
+            from ccpick import _probe_chrome_js_gate
+            ready, detail = _probe_chrome_js_gate(profile_dir)
+            if ready is False:
+                detail = 'Apple Events JS gate 未启用（profile 专属设置）'
+            return (ready, detail)
+        config_dir = os.environ.get('CLAUDE_CONFIG_DIR')
+        if os.environ.get('CCPICK_AUTOPILOT_ALLOW_MANUAL') == '1':
+            from ccpick import _probe_chrome_js_gate
+            js_ok, js_detail = _probe_chrome_js_gate(profile_dir)
+            if js_ok is not True:
+                from ccpick_enroll import launcher
+                lp = launcher()
+                if not lp:
+                    return (False, '[flow-failure] 找不到 ccpick launcher，无法启动人工点击流程')
+                argv = [lp, 'enroll', '--profile', profile_dir, '--email', email, '--timeout', str(timeout_s)]
+                if config_dir:
+                    argv += ['--config-dir', config_dir]
+                rc, out, err = _run(argv, timeout=timeout_s + 120)
+                detail = (out or err).strip()[-600:] or js_detail
+                return (rc == 0, '[manual-click] ' + detail)
+        script = here / 'ccpick_auto_authorize.py'
+        if not script.is_file():
+            return (False, '找不到 ccpick_auto_authorize.py')
+        if not sys.executable or not Path(sys.executable).is_absolute():
+            return (False, '当前 Python 解释器不是绝对路径，拒绝启动自动授权')
+        argv = [sys.executable, str(script), '--profile', profile_dir, '--email', email, '--timeout', str(timeout_s), '--no-add', '--max-attempts', str(max_attempts)]
+        if config_dir:
+            argv += ['--config-dir', config_dir]
+        rc, out, err = _run(argv, timeout=timeout_s + 120)
+        detail = (out or err).strip()[-600:]
+        if not detail:
+            detail = 'macOS 自动授权退出码 %s' % rc
+        if rc == 3:
+            return (False, '[account-refusal] ' + detail)
+        if rc == 4:
+            return (False, '[flow-failure] ' + detail)
+        return (rc == 0, detail)
+    return (False, '%s 上还没有自动点授权的实现，请人工点一次' % sys.platform)
+
+def probe_automation_prerequisite(profile_dir: str, *, headless: bool=False, user_agent: str | None=None) -> tuple[bool | None, str]:
+    return autopilot(profile_dir, '', 0, headless=headless, user_agent=user_agent)
+
 def render(rows: list[dict], src: str, fresh: str, model: str | None) -> str:
     out = []
     show = model.strip() if model and ',' not in model and (model.strip().lower() not in ('all', 'none')) else 'Fable'
@@ -231,6 +329,7 @@ def cmd_auto(args: list[str]) -> int:
     ap.add_argument('--min-gain', type=float, default=DEFAULT_MIN_GAIN, help='余量至少高这么多个点才值得切（默认 %.0f）' % DEFAULT_MIN_GAIN)
     ap.add_argument('--max-age', type=float, default=DEFAULT_MAX_AGE_S, help='缓存超过这么多秒就先刷新（默认 %d）' % DEFAULT_MAX_AGE_S)
     ap.add_argument('--no-refresh', action='store_true', help='不刷新，直接用现成缓存')
+    ap.add_argument('--enroll', action='store_true', help='一个能用的都没有时，自动跑一次入库（会开浏览器）')
     ap.add_argument('--json', action='store_true', help='机器可读')
     ns = ap.parse_args(args)
     from ccpick_enroll import cswap_bin
@@ -255,6 +354,10 @@ def cmd_auto(args: list[str]) -> int:
             src += '（%d 个槽位本轮没采到，已用本地缓存补）' % len(patched)
     meta = slot_meta()
     if not meta:
+        if ns.enroll and (not ns.dry_run):
+            code, detail = _enroll_fallback([], say)
+            res.update(action='enroll', detail=detail)
+            return finish(code)
         res.update(action='error', reason='读不到任何账号数据')
         say('读不到任何账号数据。先跑一次 cswap list。', file=sys.stderr)
         return finish(1)
@@ -271,8 +374,12 @@ def cmd_auto(args: list[str]) -> int:
         for r in rows:
             if r['why_bad']:
                 say('   %-30s %s' % (r['email'], r['why_bad']))
+        if ns.enroll and (not ns.dry_run):
+            code, detail = _enroll_fallback(rows, say)
+            res.update(action='enroll', detail=detail)
+            return finish(code)
         say('')
-        say('Sign in manually: ccpick enroll --profile NAME --add')
+        say('下一步：ccpick auto --enroll   （会开浏览器走一次授权）')
         return finish(3)
     cur_hr = cur['headroom'] if cur and cur['usable'] else None
     if cur and best['email'] == cur['email']:
@@ -309,3 +416,44 @@ def cmd_auto(args: list[str]) -> int:
     except Exception:
         pass
     return finish(0)
+
+def _enroll_fallback(rows: list[dict], say=print) -> tuple[int, str]:
+    from ccpick import list_profiles
+    from ccpick_usage import known_status
+    known = {r['email'] for r in rows if r['email']}
+    ks = known_status()
+    cands = [p for p in list_profiles() if p['account'] and p['account'] not in known and (ks.get(p['account'], {}).get('status') != 'account_on_hold')]
+    if not cands:
+        say('')
+        say('也没有可入库的 Chrome 配置文件了（都已入库或已确认被暂停）。')
+        say('要加新账号：先在 Chrome 里新建配置文件并登录 claude.ai，再跑 ccpick list。')
+        return (3, '没有可入库的配置文件')
+    if len(cands) > 1:
+        say('')
+        say('有多个候选配置文件，不替你选：')
+        for p in cands:
+            say('   %-12s %s' % (p['dir'], p['account']))
+        say('挑一个：ccpick enroll --profile "<目录名>" --add')
+        return (3, '候选不唯一: ' + ', '.join((p['dir'] for p in cands)))
+    p = cands[0]
+    say('')
+    say('唯一候选: %s (%s)，开始自动授权……' % (p['dir'], p['account']))
+    ok, detail = autopilot(p['dir'], p['account'])
+    say(detail)
+    if not ok:
+        say('')
+        say('自动授权没跑成。人工路径：ccpick enroll --profile "%s" --add' % p['dir'])
+        return (1, detail)
+    from ccpick_enroll import auth_status, cswap_bin
+    status = auth_status()
+    if not (status.get('loggedIn') and status.get('email') == p['account']):
+        detail = '自动授权结束，但 claude auth status 不是目标账号 %r' % p['account']
+        say(detail)
+        return (1, detail)
+    cswap = cswap_bin()
+    if not cswap:
+        return (1, '登录成功，但找不到 cswap，无法入库')
+    rc, out, err = _run([cswap, 'add'], timeout=180)
+    if rc != 0:
+        return (1, '登录成功，但 cswap add 失败（rc=%s）: %s' % (rc, (err or out).strip()[:200]))
+    return (0, detail)

@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -30,6 +31,43 @@ def load(name, path):
 
 
 class PathsTests(unittest.TestCase):
+    def test_redirected_cp1252_cli_json_is_utf8(self):
+        source = PUBLIC.parent / "ccpick_usage.py"
+        if not source.is_file():
+            source = PUBLIC / "src/ccpick_app/legacy/ccpick_usage.py"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "usage.json").write_text(json.dumps({"accounts": {"1": {
+                "email": "sample@example.com", "fetchedAt": time.time(),
+                "lastGood": {"scoped": [{"name": "中文模型", "pct": 20,
+                    "resets_at": "2099-01-01T00:00:00Z"}]}
+            }}}), encoding="utf-8")
+            (root / "sequence.json").write_text(json.dumps({"accounts": {
+                "1": {"email": "sample@example.com"}
+            }}), encoding="utf-8")
+            code = """
+import importlib.util, os, sys
+from pathlib import Path
+from ccpick_app.cli import main
+source, directory = sys.argv[1:]
+spec = importlib.util.spec_from_file_location('ccpick_usage', source)
+usage = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(usage)
+root = Path(directory)
+usage.CACHE = root / 'usage.json'
+usage.SEQ = root / 'sequence.json'
+usage.STATUS = root / 'status.json'
+usage.live_identity = lambda: ''
+sys.modules['ccpick_usage'] = usage
+raise SystemExit(main(['usage', '--json']))
+"""
+            env = dict(os.environ, PYTHONIOENCODING="cp1252",
+                       PYTHONPATH=str(PUBLIC / "src"), CCPICK_DATA_DIR=str(root))
+            result = subprocess.run([sys.executable, "-c", code, str(source), str(root)],
+                                    env=env, capture_output=True, encoding="utf-8", timeout=20)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("中文模型", json.loads(result.stdout)[0]["windows"])
+
     def test_linux_paths_match_backend_xdg_rules(self):
         home = Path.home()
         with patch.object(sys, "platform", "linux"), patch.object(Path, "home", return_value=home), patch.dict(os.environ, {"XDG_DATA_HOME": "relative"}, clear=True):
@@ -71,6 +109,8 @@ class CoreTests(unittest.TestCase):
         if not private_source:
             source = PUBLIC / "src/ccpick_app/legacy"
         names = ["ccpick.py", "ccpick_auto.py", "ccpick_usage.py", "ccpick_enroll.py",
+                 "ccpick_auto_authorize.py", "ccpick_cdp.py", "ccpick_js_gate.py",
+                 "ccpick_cleanup.py", "auto_authorize.ps1",
                  "autoswitch/claude-autoswitch-decide.py", "autoswitch/claude-autoswitch-helper.py"]
         for name in names:
             (cls.legacy / name).parent.mkdir(parents=True, exist_ok=True)
@@ -165,21 +205,21 @@ class CoreTests(unittest.TestCase):
                 if isinstance(node, ast.BinOp):
                     self.assertNotEqual(ast.unparse(node), "Path.home() / '.claude' / 'tools' / 'ccpick'")
 
-    def test_export_omits_automated_authorization(self):
-        banned = {"ccpick_auto_authorize", "ccpick_cdp", "ccpick_js_gate"}
-        for path in self.legacy.rglob("*.py"):
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-            for node in ast.walk(tree):
-                if isinstance(node, ast.ImportFrom):
-                    self.assertNotIn(node.module, banned, str(path))
-                if isinstance(node, ast.Import):
-                    for alias in node.names:
-                        self.assertNotIn(alias.name, banned, str(path))
-                if isinstance(node, ast.FunctionDef):
-                    self.assertNotIn(node.name, {"autopilot", "cmd_auto_enroll", "cmd_auto_enroll_all"})
+    def test_authorization_modules_import_with_opt_in_defaults(self):
+        with patch.object(sys, "path", [str(self.legacy), *sys.path]), patch.dict(sys.modules):
+            for name in ("ccpick", "ccpick_cleanup", "ccpick_auto_authorize", "ccpick_cdp", "ccpick_js_gate"):
+                sys.modules.pop(name, None)
+            import ccpick_auto_authorize
+            import ccpick_cdp
+            import ccpick_js_gate
+            self.assertTrue(callable(ccpick_auto_authorize.cmd_auto_enroll))
+            self.assertTrue(callable(ccpick_js_gate.cmd_enable_js_gate))
+            parameters = inspect.signature(ccpick_cdp.ChromePipe).parameters
+            self.assertFalse(parameters["headless"].default)
+            self.assertIsNone(parameters["user_agent"].default)
 
-    def test_removed_commands_cannot_be_interpreted_as_urls(self):
-        for command in ("auto-enroll", "auto-enroll-all", "enable-js-gate"):
+    def test_unknown_commands_cannot_be_interpreted_as_urls(self):
+        for command in ("missing-command", "cleanup-profile"):
             self.assertEqual(cli.main([command]), 2)
 
     def test_public_command_help_imports_without_authorization(self):
@@ -191,7 +231,9 @@ class CoreTests(unittest.TestCase):
                 with self.assertRaises(SystemExit) as result:
                     cli.main([command, "--help"])
                 self.assertEqual(result.exception.code, 0, command)
-            for flags in (("auto", "--enroll"), ("enroll", "--headless"),
+            for command in ("auto-enroll", "auto-enroll-all"):
+                self.assertEqual(cli.main([command, "--help"]), 0)
+            for flags in (("enroll", "--headless"),
                           ("enroll", "--user-agent", "example"),
                           ("enroll", "--config-dir", str(self.case), "--add")):
                 with self.assertRaises(SystemExit) as result:

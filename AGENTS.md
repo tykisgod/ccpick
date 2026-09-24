@@ -6,7 +6,7 @@ Before proposing a change, run:
 
 ```sh
 python tools/check_public.py
-python -m unittest discover -s tests -v
+python tools/test_package.py
 python tools/test_core.py
 ```
 
@@ -18,4 +18,4 @@ Expected result: exit 0 for each command. Platform-specific regression skips are
 
 Keep credentials, OAuth URLs/codes, browser profile data, account exports, local status, and user logs out of this repository. Diagnostic failures should identify a file or field without echoing sensitive values. Only documentation-domain email fixtures belong in tests.
 
-Automatic authorization clickers and headless login are outside this public package's scope.
+Automatic authorization, batch enrollment, headless mode, and User-Agent overrides are explicitly invoked features. Their tests must use synthetic pages and subprocess mocks; never authorize a real account or change a user's Chrome profile as a test. Preserve manual login and report unsupported browser behavior without claiming success.

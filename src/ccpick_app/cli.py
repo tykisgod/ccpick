@@ -22,6 +22,9 @@ HELP = """ccpick — Claude account switching and Chrome profile selection
   ccpick auto [--dry-run] [--json]  Choose among enabled managed accounts
   ccpick login [--profile NAME]    Sign in with manual browser authorization
   ccpick enroll --profile NAME --add  Sign in and save the account
+  ccpick auto-enroll --profile NAME --email EMAIL  Automate browser authorization
+  ccpick auto-enroll-all [--dry-run]  Authorize selected profiles in sequence
+  ccpick enable-js-gate [...]      Configure macOS Apple Events JavaScript access
   ccpick switch [ACCOUNT]          Switch accounts
   ccpick add [--slot N]            Save the current account
   ccpick disable ACCOUNT          Exclude an account from automatic rotation
@@ -30,7 +33,9 @@ HELP = """ccpick — Claude account switching and Chrome profile selection
   ccpick autoswitch tick          Run one background switching check
 
 Use COMMAND --help for command-specific options.
-An HTTP(S) URL is routed to the browser; OAuth consent remains manual.
+An HTTP(S) URL is routed to the browser.
+Automatic authorization is opt-in. auto-enroll commands accept --headless and
+--user-agent; compatibility depends on Chrome and the account's login flow.
 """
 
 
@@ -94,6 +99,7 @@ def _login(args: list[str]) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    runtime.configure_stdio()
     args = list(sys.argv[1:] if argv is None else argv)
     if not args or args[0] in ("-h", "--help", "help"):
         print(HELP)
@@ -131,6 +137,15 @@ def main(argv: list[str] | None = None) -> int:
         if cmd == "enroll":
             from ccpick_enroll import cmd_enroll
             return cmd_enroll(tail)
+        if cmd in ("auto-enroll", "autoenroll"):
+            from ccpick_enroll import cmd_auto_enroll
+            return cmd_auto_enroll(tail)
+        if cmd in ("auto-enroll-all", "autoenrollall"):
+            from ccpick_enroll import cmd_auto_enroll_all
+            return cmd_auto_enroll_all(tail)
+        if cmd == "enable-js-gate":
+            from ccpick_js_gate import cmd_enable_js_gate
+            return cmd_enable_js_gate(tail)
         if cmd == "--url-stdin":
             import ccpick
             return ccpick.handle_url(sys.stdin.readline().rstrip("\n"))

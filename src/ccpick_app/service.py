@@ -175,6 +175,7 @@ def tick(*, dry_run: bool = False) -> int:
 
 
 def main(argv=None) -> int:
+    runtime.configure_stdio()
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] in ("_decide", "_helper"):
         filename = "claude-autoswitch-decide.py" if argv[0] == "_decide" else "claude-autoswitch-helper.py"

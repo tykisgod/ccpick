@@ -161,7 +161,7 @@ def live_identity(timeout: float=5.0) -> str | None:
     try:
         env = dict(os.environ)
         env['BROWSER'] = 'true'
-        out = subprocess.run([exe, 'auth', 'status'], capture_output=True, text=True, timeout=timeout, env=env).stdout
+        out = subprocess.run([exe, 'auth', 'status'], capture_output=True, text=True, timeout=timeout, env=env, encoding='utf-8', errors='replace').stdout
         return json.loads(out.lstrip('\ufeff').strip()).get('email')
     except Exception:
         return None

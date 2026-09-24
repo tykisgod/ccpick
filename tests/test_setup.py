@@ -37,7 +37,11 @@ class SetupTests(unittest.TestCase):
         self.stack.enter_context(patch.object(setup, "_require_installed_runtime"))
         self.stack.enter_context(patch.object(setup, "_legacy_installation", return_value=False))
         self.conflicts = self.stack.enter_context(patch.object(setup, "legacy_services", return_value=[]))
-        self.stack.enter_context(patch.dict(os.environ, {"SHELL": "/bin/zsh"}, clear=False))
+        self.stack.enter_context(patch.dict(os.environ, {
+            "SHELL": "/bin/zsh",
+            "ZDOTDIR": str(self.home),
+            "CLAUDE_CONFIG_DIR": str(self.home / ".claude"),
+        }, clear=False))
         self.stack.enter_context(redirect_stdout(io.StringIO()))
 
     def test_browser_dry_run_writes_nothing(self):

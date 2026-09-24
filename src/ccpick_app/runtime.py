@@ -7,6 +7,15 @@ import sys
 import sysconfig
 
 
+def configure_stdio() -> None:
+    """Keep redirected CLI output and Python child output consistently UTF-8."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="replace")
+    os.environ["PYTHONIOENCODING"] = "utf-8"
+
+
 def _xdg(variable: str, default: Path) -> Path:
     value = os.environ.get(variable)
     candidate = Path(value).expanduser() if value else default
@@ -60,6 +69,11 @@ def launcher_path() -> str | None:
 
 def detached_creationflags() -> int:
     return 0x08000000 if sys.platform == "win32" else 0
+
+
+def powershell_path() -> str:
+    return str(Path(os.environ.get("SystemRoot", r"C:\Windows")) /
+               "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe")
 
 
 def account_enabled(slot: str, email: str = "", sequence: Path | None = None) -> bool:

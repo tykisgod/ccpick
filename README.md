@@ -38,7 +38,21 @@ ccpick enable 2
 
 To add another account, log in using Claude Code's `/login`, finish authorization yourself, then run `ccpick add`. After browser-hook setup, `/login` offers a Chrome profile picker. `ccpick list` lists Chrome profiles; `ccpick accounts` lists saved Claude accounts.
 
-Authorization stays on the official login page. The public package does not contain automatic authorization clickers, headless login, or User-Agent overrides.
+Authorization uses the official login page. You can also explicitly run automatic authorization and batch enrollment:
+
+```sh
+ccpick auto-enroll --profile "Profile 1" --email account@example.com
+ccpick auto-enroll-all --dry-run
+ccpick auto-enroll-all --profiles "Profile 1" "Profile 2"
+ccpick auto-enroll --profile "Profile 1" --email account@example.com --headless
+ccpick auto-enroll --profile "Profile 1" --email account@example.com --headless --user-agent "YOUR_USER_AGENT"
+```
+
+These commands may click login/authorization buttons and update the active Claude account. Use Chrome profiles you control and read the dry-run output before a batch. Normal commands do not enable headless mode or change the browser's User-Agent.
+
+**Browser automation is experimental.** The existing CDP backend requires Chrome to be fully closed before it launches a browser. Chrome 136+ disables remote debugging of the default user-data directory. For CDP, set `CCPICK_CHROME_USER_DATA_DIR` to a dedicated non-default Chrome data directory that you have created and signed into. See [Chrome's official explanation](https://developer.chrome.com/blog/remote-debugging-port). Headless OAuth and a custom User-Agent are available options, not a guarantee that the login provider accepts the flow. A real login is not exercised in CI.
+
+On macOS the AppleScript fallback needs Chrome's per-profile JavaScript setting. `ccpick enable-js-gate --profiles "Profile 1"` previews it; add `--apply` only after exiting Chrome. This setting permits applications already authorized to automate Chrome to run JavaScript in that profile; use `--disable --apply` to turn it back off. Windows retains its UI Automation fallback. If automation cannot proceed, use the manual `/login` flow above.
 
 ## Desktop integration
 
@@ -93,7 +107,7 @@ ccpick runs locally. It uses the installed Claude Code and claude-swap commands;
 ```sh
 python -m pip install -e .
 python tools/check_public.py
-python -m unittest discover -s tests -v
+python tools/test_package.py
 python tools/test_core.py
 ```
 

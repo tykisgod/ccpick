@@ -39,7 +39,21 @@ ccpick enable 2
 
 添加下一个账号：在 Claude Code 执行 `/login`，亲自完成官方页面上的授权，再执行 `ccpick add`。装好浏览器钩子后，`/login` 会弹出 Chrome 配置文件选择器。
 
-公开版不包含自动点击授权、无头登录或修改 User-Agent 的功能。
+公开版包含自动点击授权、批量入库、无头登录和自定义 User-Agent，通过下面的命令显式启用：
+
+```sh
+ccpick auto-enroll --profile "Profile 1" --email account@example.com
+ccpick auto-enroll-all --dry-run
+ccpick auto-enroll-all --profiles "Profile 1" "Profile 2"
+ccpick auto-enroll --profile "Profile 1" --email account@example.com --headless
+ccpick auto-enroll --profile "Profile 1" --email account@example.com --headless --user-agent "YOUR_USER_AGENT"
+```
+
+这些命令会操作官方登录/授权页面，并可能更换 Claude 当前账号；请选择本人控制的 Chrome 配置文件，批量操作前先看 `--dry-run`。普通命令不会自动开启无头模式或修改 User-Agent。
+
+**浏览器自动化属于实验功能。** 原 CDP 实现需要先完全退出 Chrome；Chrome 136+ 禁止默认用户数据目录的远程调试。使用 CDP 时，把 `CCPICK_CHROME_USER_DATA_DIR` 指向自己创建并登录过的专用非默认 Chrome 数据目录，具体原因见 [Chrome 官方说明](https://developer.chrome.com/blog/remote-debugging-port)。无头 OAuth 和自定义 User-Agent 虽然可用，但尚未完成真实登录兼容性验证，也不保证登录提供方接受该流程。CI 不执行真实授权。
+
+macOS 的 AppleScript 回退需要逐配置文件启用 Chrome 的 JavaScript 设置：`ccpick enable-js-gate --profiles "Profile 1"` 先预览，退出 Chrome 后加 `--apply` 才修改。开启后，已获 Chrome 自动化权限的应用能在该配置文件中运行 JavaScript；用 `--disable --apply` 可以关闭。Windows 保留 UI Automation 回退。自动化不适用时，可继续用上面的手动 `/login`。
 
 ## 托盘、菜单栏与浏览器钩子
 

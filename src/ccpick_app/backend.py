@@ -32,6 +32,11 @@ def command(args: list[str]) -> list[str]:
 
 
 def run(args: list[str], **kwargs) -> subprocess.CompletedProcess:
+    kwargs["env"] = dict(os.environ if kwargs.get("env") is None else kwargs["env"],
+                         PYTHONIOENCODING="utf-8")
+    if kwargs.get("text") or kwargs.get("universal_newlines"):
+        kwargs.setdefault("encoding", "utf-8")
+        kwargs.setdefault("errors", "replace")
     return subprocess.run(command(args), **kwargs)
 
 

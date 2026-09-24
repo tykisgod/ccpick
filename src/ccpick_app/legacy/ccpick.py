@@ -155,7 +155,7 @@ def _run_osascript(script: str, timeout: int=15) -> subprocess.CompletedProcess 
     if not Path(OSASCRIPT).is_file():
         return None
     try:
-        return subprocess.run([OSASCRIPT, '-'], input=script, capture_output=True, text=True, timeout=timeout)
+        return subprocess.run([OSASCRIPT, '-'], input=script, capture_output=True, text=True, timeout=timeout, encoding='utf-8', errors='replace')
     except Exception:
         return None
 
@@ -163,7 +163,7 @@ def _spawn_osascript_detached(script: str) -> bool:
     if not Path(OSASCRIPT).is_file():
         return False
     try:
-        proc = subprocess.Popen([OSASCRIPT, '-'], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True, start_new_session=True)
+        proc = subprocess.Popen([OSASCRIPT, '-'], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True, start_new_session=True, encoding='utf-8', errors='replace')
         assert proc.stdin is not None
         proc.stdin.write(script)
         proc.stdin.close()
@@ -436,7 +436,7 @@ def pick_profile_native(profiles: list[dict]) -> str | None:
         if not Path(osa).is_file():
             return PICK_CANCEL
         try:
-            out = subprocess.run([osa, '-'], input=script, capture_output=True, text=True, timeout=180).stdout.strip()
+            out = subprocess.run([osa, '-'], input=script, capture_output=True, text=True, timeout=180, encoding='utf-8', errors='replace').stdout.strip()
         except Exception:
             return PICK_CANCEL
         head = out.split('.', 1)[0].strip()
@@ -456,7 +456,7 @@ def pick_profile_native(profiles: list[dict]) -> str | None:
         try:
             with os.fdopen(fd, 'w', encoding='utf-8-sig') as fh:
                 fh.write(ps)
-            out = subprocess.run([psexe, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', path], capture_output=True, text=True, timeout=180).stdout.strip()
+            out = subprocess.run([psexe, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', path], capture_output=True, text=True, timeout=180, encoding='utf-8', errors='replace').stdout.strip()
             if out.isdigit() and 0 <= int(out) < len(profiles):
                 return profiles[int(out)]['dir']
         except Exception:
@@ -478,7 +478,7 @@ def _detach_picker(url: str) -> bool:
     env = dict(os.environ)
     env[ENV_DETACHED_PICKER] = '1'
     try:
-        proc = subprocess.Popen([sys.executable, '-m', 'ccpick_app', '--url-stdin'], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True, env=env, start_new_session=True, creationflags=_runtime.detached_creationflags())
+        proc = subprocess.Popen([sys.executable, '-m', 'ccpick_app', '--url-stdin'], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True, env=env, start_new_session=True, creationflags=_runtime.detached_creationflags(), encoding='utf-8', errors='replace')
         assert proc.stdin is not None
         marker = env.get(ENV_PICKER_MARKER)
         if marker:
@@ -541,7 +541,7 @@ def _python_candidates() -> list[str]:
 def _probe_tkinter(executable: str) -> tuple[bool, str]:
     code = "import tkinter as tk; r=tk.Tk(); r.withdraw(); r.update_idletasks(); print('Tk '+str(tk.TkVersion)); r.destroy()"
     try:
-        r = subprocess.run([executable, '-c', code], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)
+        r = subprocess.run([executable, '-c', code], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20, encoding='utf-8', errors='replace')
     except Exception as e:
         return (False, f'{executable} — {type(e).__name__}')
     if r.returncode == 0:
@@ -567,6 +567,58 @@ def validate_launcher(path: str | None) -> tuple[bool, str]:
     if not os.access(p, os.X_OK):
         return (False, f'没有执行权限: {path}')
     return (True, str(p))
+JS_GATE_REMEDIATION = '这个开关按 Chrome profile 单独保存，且菜单项不能由工具代点。'
+
+def _probe_chrome_applescript() -> tuple[bool, str, int | None]:
+    script = '-- ★AppleScript 的 tab 常量在 tell application "Google Chrome" 块内会被\n-- Chrome 字典的 tab(标签页)类遮蔽，拼出的是字面量 "tab" 而不是制表符。\n-- 所以分隔符一律在块外求值成 SEP 再用。实测: 块内 "A"&tab&"B" -> A t a b B。\nset SEP to tab\nif application "Google Chrome" is running then\n    tell application "Google Chrome"\n        return (name as text) & SEP & (version as text) & SEP & (count of windows as text)\n    end tell\nelse\n    return "__NOT_RUNNING__"\nend if\n'
+    r = _run_osascript(script)
+    if r is None:
+        return (False, 'osascript 不存在或执行超时', None)
+    if r.returncode != 0:
+        return (False, (r.stderr or 'AppleScript 调用失败').strip()[-300:], None)
+    out = r.stdout.strip()
+    if out == '__NOT_RUNNING__':
+        return (False, 'Chrome 未运行；未启动它，避免 doctor 抢屏', 0)
+    parts = out.split('\t')
+    if len(parts) != 3 or not parts[2].isdigit():
+        return (False, f'AppleScript 返回不可识别: {out[:200]}', None)
+    return (True, f'{parts[0]} {parts[1]}，{parts[2]} 个窗口', int(parts[2]))
+
+def _js_gate_remediation(profile_dir: str) -> str:
+    return '%s 请完全退出 Chrome 后运行 ccpick enable-js-gate --profiles %s --apply；也可在目标 profile 中手动打开 View > Developer > Allow JavaScript from Apple Events。' % (JS_GATE_REMEDIATION, json.dumps(profile_dir, ensure_ascii=False))
+
+def _probe_chrome_js_gate(profile_dir: str, user_data_dir: Path | None=None) -> tuple[bool | None, str]:
+    user_data = user_data_dir if user_data_dir is not None else chrome_user_data_dir()
+    if user_data is None:
+        return (None, '找不到 Chrome User Data，无法读取 profile 开关')
+    prefs = user_data / profile_dir / 'Preferences'
+    try:
+        data = json.loads(prefs.read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        return (None, '%s 不存在' % prefs)
+    except Exception as e:
+        return (None, '%s 无法解析（%s）' % (prefs, type(e).__name__))
+    if not isinstance(data, dict):
+        return (None, '%s 顶层不是对象' % prefs)
+
+    def value_at(*keys):
+        value = data
+        for key in keys:
+            if not isinstance(value, dict) or key not in value:
+                return None
+            value = value[key]
+        return value
+    direct = value_at('browser', 'allow_javascript_apple_events')
+    mirror = value_at('account_values', 'browser', 'allow_javascript_apple_events')
+    values = [value for value in (direct, mirror) if value is not None]
+    if any((not isinstance(value, bool) for value in values)):
+        return (None, '%s 的开关值不是布尔值' % profile_dir)
+    if len(values) == 2 and values[0] != values[1]:
+        return (None, '%s 的 browser/account_values 镜像不一致' % profile_dir)
+    enabled = any(values)
+    if enabled:
+        return (True, '%s 已启用（profile 专属设置）' % profile_dir)
+    return (False, _js_gate_remediation(profile_dir))
 
 def _cswap_managed_count() -> tuple[bool, int | None, str]:
     seq = _runtime.backend_data_dir() / 'sequence.json'
@@ -581,6 +633,23 @@ def _cswap_managed_count() -> tuple[bool, int | None, str]:
     except Exception as e:
         return (False, None, f'sequence.json 无法解析（{type(e).__name__}）')
 URL_ROUTING_CASES = [('https://claude.com/cai/oauth/authorize?client_id=x', True), ('https://platform.claude.com/oauth/authorize?client_id=x', True), ('https://claude.ai/oauth/authorize', True), ('https://claude.com./oauth/authorize', True), ('HTTPS://CLAUDE.COM/oauth/authorize/', True), ('https://claude.com/settings/usage', False), ('https://mcp.atlassian.com/v1/authorize', False), ('https://github.com/anthropics/claude-code', False), ('https://evil.example.com/oauth/authorize', False), ('https://evil.com\\@claude.com/oauth/authorize', False), ('https://account-0027@example.com/oauth/authorize', False), ('https://claude.com:8080/oauth/authorize', False), ('http://claude.com/oauth/authorize', False), ('https://claude.com.evil.com/oauth/authorize', False), ('https://xn--claude-9za.com/oauth/authorize', False), ('https://claude。com/oauth/authorize', False), ('https://claude.com/oauth/authorize.evil', False), ('https://claude.com/other/oauth/authorize', False), (' https://claude.com/oauth/authorize', False), ('https://claude.com/oauth/authorize ', False), ('https://claude.com/oauth/author\nize', False), ('https://claude.com\t.evil.com/oauth/authorize', False), ('https://claude.com:bad/oauth/authorize', False)]
+
+def _autopilot_available() -> tuple[bool, str]:
+    here = Path(__file__).resolve().parent
+    try:
+        from ccpick_cdp import backend_status
+        cdp_ok, cdp_why = backend_status(chrome_binary(), chrome_user_data_dir())
+    except Exception as e:
+        cdp_ok, cdp_why = (False, 'CDP pipe 探测失败（%s）' % type(e).__name__)
+    if cdp_ok:
+        return (True, 'CDP pipe（当前首选） — %s' % cdp_why)
+    if sys.platform == 'win32':
+        ps1 = here / 'auto_authorize.ps1'
+        return (True, 'Windows UIA（当前回退） — %s；%s' % (ps1, cdp_why)) if ps1.is_file() else (False, '缺 auto_authorize.ps1；%s' % cdp_why)
+    if sys.platform == 'darwin':
+        script = here / 'ccpick_auto_authorize.py'
+        return (True, 'macOS AppleScript（当前回退） — %s；%s' % (script, cdp_why)) if script.is_file() else (False, '缺 ccpick_auto_authorize.py；%s' % cdp_why)
+    return (False, '%s 尚未实现 → ccpick_auto.autopilot()' % sys.platform)
 
 def launcher_path() -> str | None:
     return _runtime.launcher_path()

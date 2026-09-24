@@ -23,10 +23,6 @@ STATE_FILES = {
     "claude-autoswitch-ledger.json", "claude-autoswitch-samples.json",
     "cookies", "cookies.sqlite", "login data", "local state", "web data",
 }
-EXCLUDED_MODULES = {
-    "ccpick_auto_authorize.py", "ccpick_cdp.py", "ccpick_js_gate.py",
-    "auto_authorize.ps1",
-}
 PRIVATE_DIRS = {"credentials", "keychains", "browser-profiles"}
 PRIVATE_SUFFIXES = {".jsonl", ".cswap", ".keychain", ".keychain-db"}
 
@@ -132,8 +128,6 @@ def check_tree(root: Path) -> list[str]:
                 or any(part.casefold() in PRIVATE_DIRS for part in relative.parts[:-1])
                 or name == ".env" or (name.startswith(".env.") and name != ".env.example")):
             findings.append(f"{label}:1: local state or credential dump")
-        if name in EXCLUDED_MODULES:
-            findings.append(f"{label}:1: excluded automatic authorization module")
         try:
             data = path.read_bytes()
             if b"\x00" in data:

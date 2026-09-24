@@ -1,5 +1,7 @@
 # Working on ccpick
 
+If the user asks you to install or configure ccpick on their computer, follow [AGENT_SETUP.md](AGENT_SETUP.md). The instructions below concern repository development; a user installation should use the tagged package and the setup playbook, not an editable checkout.
+
 Use Python 3.12 or newer. Install with `python -m pip install -e .`.
 
 Before proposing a change, run:

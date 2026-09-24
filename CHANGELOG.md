@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Add an agent installation playbook and copyable setup prompts at the top of both READMEs.
+- Add an original ccpick icon to the repository header.
+
 ## 0.1.0 — 2026-09-24
 
 - Initial public alpha with an automatically installed, pinned claude-swap dependency.

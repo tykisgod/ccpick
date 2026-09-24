@@ -1,4 +1,19 @@
+<p align="center">
+  <img src="assets/ccpick-icon.png" alt="ccpick: switching between account cards" width="128" height="128">
+</p>
+
 # ccpick
+
+> [!IMPORTANT]
+> **Let your coding agent install and configure ccpick.** You do not need to set it up by hand or copy the shell commands below. Give an agent with terminal access the prompt below; it will check your system, apply the appropriate setup, and verify the result. You handle any interactive login or system permission prompts.
+>
+> **[Agent installation guide →](AGENT_SETUP.md)**
+
+Copy this into your coding agent:
+
+```text
+Read https://raw.githubusercontent.com/tykisgod/ccpick/main/AGENT_SETUP.md and install and configure ccpick on this computer. On Windows/macOS, set up the browser hook and tray/menu bar with automatic switching; on Linux, set up the CLI. Use my existing accounts first. Carry out the setup and verify it, rather than just giving me commands. Ask me only for missing account choices, interactive login/permissions, or replacing an existing installation I have not already authorized.
+```
 
 [简体中文](README.zh-CN.md) · [Releases](https://github.com/tykisgod/ccpick/releases)
 
@@ -8,7 +23,7 @@ ccpick provides a command line, a Windows tray, and a macOS menu bar. It uses [c
 
 **Initial alpha release.** The package and decision logic run in CI on Windows, macOS, and Linux. Browser login and desktop startup still depend on your local Claude Code, Chrome, and OS permissions. Linux supports the command line; desktop services are Windows/macOS only.
 
-## Install
+## Installation reference (for your agent)
 
 Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then:
 

@@ -1,4 +1,19 @@
+<p align="center">
+  <img src="assets/ccpick-icon.png" alt="ccpick：账号卡片切换图标" width="128" height="128">
+</p>
+
 # ccpick
+
+> [!IMPORTANT]
+> **请让 coding agent 帮你安装和配置，不要自己照抄命令设置。** 把下面这段话交给能操作终端的 agent，让它检查环境、完成配置并验证结果。需要登录或系统权限时，你再配合操作即可。
+>
+> **[给 agent 的安装配置指南 →](AGENT_SETUP.md)**
+
+直接复制给你的 coding agent：
+
+```text
+请阅读 https://raw.githubusercontent.com/tykisgod/ccpick/main/AGENT_SETUP.md ，在这台电脑上安装并配置 ccpick。Windows/macOS 请配置浏览器钩子和带自动切号功能的托盘/菜单栏，Linux 请配置命令行。优先使用我的现有账号。请实际完成设置和验证，不要只给我一串命令。只有缺少账号选择、需要我登录或授予系统权限，或要替换我尚未同意替换的旧安装时，才向我提问。
+```
 
 [English](README.md) · [版本下载](https://github.com/tykisgod/ccpick/releases)
 
@@ -8,7 +23,7 @@
 
 这是首个 alpha 版本。Windows、macOS、Linux 在 CI 中验证包安装和决策逻辑；实际浏览器登录、自启和系统权限仍需在使用者机器上验证。Linux 第一版只提供命令行。
 
-## 安装
+## 安装参考（供 agent 使用）
 
 先安装 [uv](https://docs.astral.sh/uv/getting-started/installation/)，然后执行：
 

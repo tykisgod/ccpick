@@ -347,14 +347,40 @@ class PublicPrivacyTests(unittest.TestCase):
         from unittest import mock
         self.receipt({"missing.py": "a" * 64})
         self.assertTrue(CHECK.check_export_record(self.root))
-        path = self.write("source.py", "safe")
+        # The checker canonicalizes its root. macOS temporary directories and
+        # Windows short-name TEMP paths can have a different lexical spelling.
+        path = self.write("source.py", "safe").resolve()
         self.receipt({"source.py": hashlib.sha256(path.read_bytes()).hexdigest()})
         with mock.patch.object(Path, "is_symlink", lambda value: value == path):
             self.assertTrue(CHECK.check_export_record(self.root))
-        nested = self.write("nested/source.py", "safe")
+        nested = self.write("nested/source.py", "safe").resolve()
         self.receipt({"nested/source.py": hashlib.sha256(nested.read_bytes()).hexdigest()})
         with mock.patch.object(Path, "is_symlink", lambda value: value == nested.parent):
             self.assertTrue(CHECK.check_export_record(self.root))
+
+    def test_export_receipt_rejects_links_after_root_alias_resolution(self) -> None:
+        from unittest import mock
+        canonical = (self.root / "canonical").resolve()
+        source = canonical / "nested" / "source.py"
+        source.parent.mkdir(parents=True)
+        source.write_text("safe", encoding="utf-8")
+        (canonical / CHECK.EXPORT_RECORD).write_text(json.dumps({
+            "format": 1, "files": {"nested/source.py": hashlib.sha256(source.read_bytes()).hexdigest()}
+        }), encoding="utf-8")
+        alias = self.root / "lexical-alias"
+        original_resolve = Path.resolve
+
+        def resolve(path, *args, **kwargs):
+            return canonical if path == alias else original_resolve(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "resolve", resolve):
+            self.assertEqual(CHECK.check_export_record(alias), [])
+            for method, target in (("is_symlink", source), ("is_symlink", source.parent),
+                                   ("is_junction", source.parent)):
+                with self.subTest(method=method, parent=target == source.parent):
+                    with mock.patch.object(Path, method, lambda value, target=target: value == target,
+                                           create=True):
+                        self.assertTrue(CHECK.check_export_record(alias))
 
     def test_packed_export_receipt_uses_its_own_members(self) -> None:
         path = self.root / "sample.whl"

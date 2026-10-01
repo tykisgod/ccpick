@@ -521,10 +521,12 @@ for (const laterPicker of [false, true]) test(`expired staged login uses its rec
   await f.start(); assert.equal((await exchangeLogin(f)).status, 200);
   const pending = f.writes.find(value => value.value.oauthResponse);
   if (laterPicker) { await f.control('/select', { name: 'account-b' }); await f.control('/select', { name: 'account-a' }); }
-  const native = grant('B'); native.claudeAiOauth.subscriptionType = 'pro';
-  f.values.set(runtimeDirectory(f.config), native);
   await f.service.close();
   const recordPath = path.join(pending.directory, 'record.json'), record = await readJson(recordPath);
+  assert.equal(record.acknowledgedAt, undefined, 'recovery fixture must begin with an uncommitted journal');
+  assert.notEqual(f.values.get(f.profiles.B.configDirectory).ccpickRuntimeGrant?.id, record.id);
+  const native = grant('B'); native.claudeAiOauth.subscriptionType = 'pro';
+  f.values.set(runtimeDirectory(f.config), native);
   await atomicJson(recordPath, { ...record, capturedAt: new Date(Date.now() - 7_200_000).toISOString() });
   expiredOldB = true; await f.start();
   assert.equal(f.values.get(f.profiles.B.configDirectory).claudeAiOauth.accessToken, 'INVENTED-B-ACCESS-NEW');
@@ -532,6 +534,37 @@ for (const laterPicker of [false, true]) test(`expired staged login uses its rec
   assert.equal((await f.model()).status, 200);
   assertOwner(f.calls.at(-1), laterPicker ? 'A' : 'B');
   assert.equal((await registryState(f.config)).selected, laterPicker ? 'account-a' : 'account-b');
+});
+
+test('shutdown drains an in-flight native completion without replaying its committed journal', async t => {
+  const f = await fixture(t); await f.start();
+  assert.equal((await exchangeLogin(f)).status, 200);
+  const pending = f.writes.find(value => value.value.oauthResponse);
+  await f.control('/select', { name: 'account-b' }); await f.control('/select', { name: 'account-a' });
+  const selected = await registryState(f.config), snapshot = f.service.coordinator.snapshot.bind(f.service.coordinator);
+  let entered = false, release;
+  const gate = new Promise(resolve => { release = resolve; });
+  t.mock.method(f.service.coordinator, 'snapshot', async () => {
+    entered = true; await gate; return snapshot();
+  });
+  try {
+    await until(() => entered, 'runtime poll must be in flight before shutdown');
+    const native = grant('B'); native.claudeAiOauth.subscriptionType = 'pro';
+    f.values.set(runtimeDirectory(f.config), native);
+    const closing = f.service.close(); release(); await closing;
+  } finally { release(); }
+  const recordPath = path.join(pending.directory, 'record.json'), record = await readJson(recordPath);
+  assert(record.acknowledgedAt);
+  const saved = structuredClone(f.values.get(f.profiles.B.configDirectory));
+  assert.equal(saved.ccpickRuntimeGrant.id, record.id);
+  assert.equal(saved.claudeAiOauth.subscriptionType, 'pro');
+  assert.deepEqual(f.values.get(pending.directory), {});
+  await atomicJson(recordPath, { ...record, capturedAt: new Date(Date.now() - 7_200_000).toISOString() });
+  await f.start();
+  assert.deepEqual(f.values.get(f.profiles.B.configDirectory), saved);
+  assert.equal(f.accountCalls.filter(value => value.kind === 'refresh').length, 0);
+  assert.deepEqual(await registryState(f.config), selected);
+  assert.equal((await f.model()).status, 200); assertOwner(f.calls.at(-1), 'A');
 });
 
 test('a crash after vault commit but before journal erasure retries erasure without importing or probing again', async t => {

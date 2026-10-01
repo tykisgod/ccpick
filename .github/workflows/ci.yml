@@ -21,6 +21,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
       - uses: astral-sh/setup-uv@v6
         with:
           version: '0.8.23'
@@ -32,8 +35,12 @@ jobs:
         run: uv run --locked python tools/test_package.py
       - name: Decision regressions
         run: uv run --locked python tools/test_core.py
+      - name: Portable runtime regressions
+        run: uv run --locked python tools/test_profiles.py
       - name: Build distribution
-        run: uv build
+        run: python tools/build_dist.py
+      - name: Scan built distributions
+        run: python tools/check_public.py --include-build
       - name: Parse PowerShell resources
         if: runner.os == 'Windows'
         shell: powershell
@@ -54,4 +61,4 @@ jobs:
         with:
           fetch-depth: 0
       - name: Scan committed history
-        run: docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.30.1 git /repo --redact --no-banner
+        run: docker run --rm -v "$PWD:/repo" -w /repo zricethezav/gitleaks:v8.30.1 git . --config .gitleaks.toml --redact --no-banner

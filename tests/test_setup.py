@@ -161,6 +161,7 @@ class SetupTests(unittest.TestCase):
         self.assertIn(setup._ps_quote(sys.executable), tray)
         self.assertIn("-m ccpick_app switch", tray)
         self.assertNotIn('Join-Path $env:USERPROFILE ".local\\bin\\cswap.exe"', tray)
+        self.assertNotIn('Join-Path (Split-Path -Parent $Shared) "ccpick.py"', tray)
         self.assertIn("CCPICK_DATA_DIR", tray)
 
     def test_mac_assets_and_plists_have_no_private_executable_or_state_paths(self):
@@ -169,6 +170,8 @@ class SetupTests(unittest.TestCase):
         swift = assets["menubar-main.swift"]
         self.assertNotIn('p.launchPath = "/usr/bin/python3"', swift)
         self.assertNotIn('let cswap = ("~/.local/bin/cswap"', swift)
+        self.assertNotIn('~/.claude/tools/ccpick/ccpick.py', swift)
+        self.assertIn('p.launchPath = entry', swift)
         self.assertIn('"-m", "ccpick_app", "switch", email', swift)
         for label, plist in setup._mac_plists(root, state).items():
             self.assertTrue(label.startswith("io.github.tykisgod.ccpick."))

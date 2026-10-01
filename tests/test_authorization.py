@@ -1,5 +1,6 @@
 """Synthetic authorization checks: no real browser, profile, account, or consent."""
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from functools import partial
 import importlib.util
 import io
 import json
@@ -33,7 +34,7 @@ class AuthorizationTests(unittest.TestCase):
         private_source = (source / "ccpick.py").is_file()
         if not private_source:
             source = PUBLIC / "src" / "ccpick_app" / "legacy"
-        names = ["ccpick.py", "ccpick_auto.py", "ccpick_usage.py", "ccpick_enroll.py",
+        names = ["ccpick.py", "ccpick_auto.py", "ccpick_usage.py", "ccpick_enroll.py", "ccpick_coordination.py",
                  "ccpick_auto_authorize.py", "ccpick_cdp.py", "ccpick_js_gate.py",
                  "ccpick_cleanup.py", "auto_authorize.ps1",
                  "autoswitch/claude-autoswitch-decide.py", "autoswitch/claude-autoswitch-helper.py"]
@@ -50,6 +51,10 @@ class AuthorizationTests(unittest.TestCase):
         self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory(prefix="ccpick-auth-case-")))
         self.user_data = self.root / "Chrome User Data"
         (self.user_data / "Default").mkdir(parents=True)
+        installed_launcher = self.root / ".local" / "bin" / "ccpick"
+        installed_launcher.parent.mkdir(parents=True)
+        installed_launcher.write_text("synthetic launcher, never executed\n", encoding="utf-8")
+        installed_launcher.chmod(0o700)
         self.stack.enter_context(patch.object(Path, "home", return_value=self.root))
         self.stack.enter_context(patch.object(runtime, "data_dir", return_value=self.root / "state"))
         self.stack.enter_context(patch.object(runtime, "backend_data_dir", return_value=self.root / "backend"))
@@ -66,10 +71,16 @@ class AuthorizationTests(unittest.TestCase):
         self.popen = self.stack.enter_context(patch("subprocess.Popen", side_effect=AssertionError("No real browser allowed")))
         self.stack.enter_context(patch.dict(sys.modules, {}))
         for name in ("ccpick", "ccpick_cleanup", "ccpick_auto_authorize", "ccpick_cdp",
-                     "ccpick_js_gate", "ccpick_usage", "ccpick_enroll", "ccpick_auto"):
+                     "ccpick_js_gate", "ccpick_usage", "ccpick_coordination", "ccpick_enroll", "ccpick_auto"):
             module = load_module(name, self.legacy / (name + ".py"))
             sys.modules[name] = module
             setattr(self, name.removeprefix("ccpick_") if name != "ccpick" else "core", module)
+        # Exercise the real settings guard against synthetic settings only.
+        # A source checkout's parents or the host's managed settings must not
+        # make these mocked authorization cases depend on a real installation.
+        self.stack.enter_context(patch.object(self.enroll, "browser_override_reason", partial(
+            self.enroll.browser_override_reason, home=self.root, cwd=self.root,
+            managed_settings=self.root / "managed-settings.json")))
         self.profile = {"dir": "Default", "name": "Synthetic profile", "account": "person@example.com"}
         self.stack.enter_context(patch.object(self.core, "list_profiles", return_value=[self.profile]))
         self.stack.enter_context(patch.object(self.core, "load_profile_accounts", return_value={}))
@@ -138,6 +149,67 @@ class AuthorizationTests(unittest.TestCase):
         self.assertEqual(list((self.user_data / "Default").iterdir()), [preferences])
         self.run.assert_not_called()
         self.popen.assert_not_called()
+
+    def test_browser_override_blocks_every_login_entry_before_auth_or_browser(self):
+        config = self.root / "isolated-config"
+        config.mkdir()
+        (config / "settings.json").write_text(
+            json.dumps({"browser": "/synthetic/controlled-browser"}), encoding="utf-8")
+        with patch.object(self.enroll, "claude_bin", return_value="/synthetic/claude"), \
+                patch.object(self.enroll, "auth_status") as status, \
+                patch.object(self.auto, "autopilot") as authorize, \
+                patch.object(self.enroll, "_managed_account_rows", return_value=([], None)), \
+                patch.object(self.auto, "probe_automation_prerequisite", return_value=(True, "synthetic ready")):
+            commands = [
+                ["login", "--profile", "Default"],
+                ["enroll", "--profile", "Default", "--config-dir", str(config)],
+                ["enroll-all", "--profiles", "Default", "--config-dir", str(config)],
+                ["auto-enroll", "--profile", "Default", "--email", "person@example.com",
+                 "--config-dir", str(config)],
+                ["auto-enroll-all", "--profiles", "Default", "--config-dir", str(config)],
+            ]
+            for command in commands:
+                with self.subTest(command=command[0]):
+                    self.assertNotEqual(cli.main(command), 0)
+            direct = self.enroll.enroll_one(
+                "Default", "person@example.com", self.root / "synthetic-code", str(config))
+            self.assertFalse(direct["ok"])
+            self.assertIn("settings.browser", direct["reason"])
+            fallback, _ = self.auto._enroll_fallback([], say=lambda _message: None)
+            self.assertNotEqual(fallback, 0)
+            self.assertEqual(cli.main(["auto-enroll-all", "--dry-run"]), 0)
+            status.assert_not_called()
+            authorize.assert_not_called()
+        self.run.assert_not_called()
+        self.popen.assert_not_called()
+        self.assertIn("settings.browser", self.errors.getvalue())
+        self.assertNotIn("/synthetic/controlled-browser", self.errors.getvalue())
+
+    def test_browser_override_guard_checks_user_project_env_and_unreadable_settings(self):
+        launcher = str(self.root / ".local" / "bin" / "ccpick")
+        project = self.root / "project"
+        project.mkdir()
+        managed = self.root / "managed-settings.json"
+        config = self.root / "isolated-config"
+        config.mkdir()
+        user_settings = self.root / ".claude" / "settings.json"
+        user_settings.parent.mkdir()
+        user_settings.write_text(json.dumps({"browser": launcher}), encoding="utf-8")
+        self.assertIsNone(self.enroll.browser_override_reason(
+            launcher, str(config), home=self.root, cwd=project, managed_settings=managed))
+        user_settings.write_text(json.dumps({"env": {"BROWSER": "/synthetic/other"}}), encoding="utf-8")
+        self.assertIn("settings.env.BROWSER", self.enroll.browser_override_reason(
+            launcher, str(config), home=self.root, cwd=project, managed_settings=managed))
+        user_settings.write_text("{}", encoding="utf-8")
+        project_settings = project / ".claude" / "settings.local.json"
+        project_settings.parent.mkdir()
+        project_settings.write_text(json.dumps({"browser": "/synthetic/other"}), encoding="utf-8")
+        self.assertIn("settings.browser", self.enroll.browser_override_reason(
+            launcher, str(config), home=self.root, cwd=project, managed_settings=managed))
+        project_settings.unlink()
+        (config / "settings.json").write_text("{bad json", encoding="utf-8")
+        self.assertIn("无法解析", self.enroll.browser_override_reason(
+            launcher, str(config), home=self.root, cwd=project, managed_settings=managed))
 
     def test_single_cli_defaults_and_explicit_flags(self):
         for extra, expected_headless, expected_ua in (([], False, None),

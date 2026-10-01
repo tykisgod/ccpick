@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -127,7 +128,7 @@ def _log(message: str) -> None:
         stream.write(time.strftime("%Y-%m-%d %H:%M:%S ") + message + "\n")
 
 
-def tick(*, dry_run: bool = False) -> int:
+def tick(*, dry_run: bool = False, force_check: bool = False) -> int:
     from .setup import legacy_services
     runtime.bootstrap()
     with tick_lock(state_dir() / ".tick.lock") as acquired:
@@ -147,6 +148,10 @@ def tick(*, dry_run: bool = False) -> int:
             _log(error)
             print(error, file=sys.stderr)
             return 1
+        helper = _helper()
+        status_path = state_dir() / "status.json"
+        if not force_check and not dry_run and helper.cmd_wait([str(status_path)]) == 0:
+            return 0
         command = [sys.executable, "-m", "ccpick_app.service", "_decide"]
         if dry_run:
             command.append("--dry-run")
@@ -162,6 +167,15 @@ def tick(*, dry_run: bool = False) -> int:
             if not isinstance(result, dict):
                 raise ValueError("Decision engine returned a non-object result")
             write_status(result, process.returncode)
+            if not dry_run:
+                previous_input = sys.stdin
+                try:
+                    sys.stdin = io.StringIO(json.dumps(result))
+                    if helper.cmd_defer([str(status_path)]) != 0:
+                        sys.stdin = io.StringIO(json.dumps(result))
+                        helper.cmd_schedule([str(status_path)])
+                finally:
+                    sys.stdin = previous_input
             _log(json.dumps(result, ensure_ascii=False))
             print(json.dumps(result, ensure_ascii=False))
             # stay/blocked are successful completed checks, not crashed services.
@@ -186,8 +200,10 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="ccpick autoswitch")
     parser.add_argument("command", choices=["tick"])
     parser.add_argument("--dry-run", action="store_true", help="Evaluate without switching (may refresh usage cache)")
+    parser.add_argument("--force-check", action="store_true", help="Explicitly refresh before a saved quota/monitor wait ends")
+    parser.add_argument("--now", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
-    return tick(dry_run=args.dry_run)
+    return tick(dry_run=args.dry_run, force_check=args.force_check)
 
 
 cmd_autoswitch = main

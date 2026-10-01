@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ccpick"
-version = "0.1.0"
-description = "Chrome profile picker and predictive account switching for Claude Code"
+version = "0.2.0"
+description = "Account profiles, Chrome login selection, and predictive switching for Claude Code"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
@@ -32,4 +32,4 @@ ccpick = "ccpick_app.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-ccpick_app = ["legacy/*", "legacy/autoswitch/*", "legacy/autoswitch/win/*", "resources/*", "resources/**/*"]
+ccpick_app = ["legacy/*", "legacy/autoswitch/*", "legacy/autoswitch/win/*", "resources/*", "resources/**/*", "profile_runtime/*.mjs", "profile_runtime/*.py", "profile_runtime/test/*.mjs"]

@@ -95,11 +95,77 @@ def cswap_bin() -> str | None:
 def launcher() -> str | None:
     return _runtime.launcher_path()
 
+def browser_override_reason(browser_launcher: str, config_dir: str | None=None, *, home: Path | None=None, cwd: Path | None=None, managed_settings: Path | None=None) -> str | None:
+    home = Path.home() if home is None else Path(home)
+    cwd = Path.cwd() if cwd is None else Path(cwd)
+    expected = Path(browser_launcher).expanduser().resolve()
+    files = [home / '.claude' / name for name in ('settings.json', 'settings.local.json', 'remote-settings.json')]
+    target = config_dir or os.environ.get('CLAUDE_CONFIG_DIR')
+    if target:
+        target_dir = Path(target).expanduser()
+        if not target_dir.is_absolute():
+            return 'CLAUDE_CONFIG_DIR 不是绝对路径；请检查 Claude 配置后再入库。'
+        files.extend((target_dir / name for name in ('settings.json', 'settings.local.json', 'remote-settings.json')))
+    current = cwd.resolve()
+    while True:
+        files.extend((current / '.claude' / name for name in ('settings.json', 'settings.local.json')))
+        if current.parent == current:
+            break
+        current = current.parent
+    if managed_settings is None:
+        if sys.platform == 'darwin':
+            managed_settings = Path('/Library/Application Support/ClaudeCode/managed-settings.json')
+        elif sys.platform == 'win32' and os.environ.get('ProgramData'):
+            managed_settings = Path(os.environ['ProgramData']) / 'ClaudeCode' / 'managed-settings.json'
+    if managed_settings is not None:
+        files.append(Path(managed_settings))
+    seen = set()
+    for file in files:
+        if file in seen:
+            continue
+        seen.add(file)
+        try:
+            raw = file.read_bytes()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return '%s 无法读取；请检查 Claude 配置后再入库。' % file
+        try:
+            if len(raw) > 1024 * 1024:
+                raise ValueError('settings too large')
+            settings = json.loads(raw.decode('utf-8-sig'))
+            if not isinstance(settings, dict):
+                raise ValueError('settings is not an object')
+        except (UnicodeError, ValueError):
+            return '%s 无法解析；请检查 Claude 配置后再入库。' % file
+        values = []
+        if 'browser' in settings:
+            values.append(('settings.browser', settings['browser']))
+        if 'env' in settings:
+            environment = settings['env']
+            if not isinstance(environment, dict):
+                return '%s 的 settings.env 无效；请检查 Claude 配置后再入库。' % file
+            values.extend((('settings.env.BROWSER', value) for key, value in environment.items() if key.upper() == 'BROWSER'))
+        for field, value in values:
+            if not isinstance(value, str) or not Path(value).expanduser().is_absolute() or Path(value).expanduser().resolve() != expected:
+                return '%s 的 %s 覆盖了 ccpick 浏览器入口；请使用受控登录入口，此入库流程已安全停止。' % (file, field)
+    return None
+
+def enrollment_browser_preflight(config_dir: str | None=None) -> str | None:
+    browser_launcher = launcher()
+    if not browser_launcher:
+        return '找不到 ccpick 浏览器入口；此入库流程已安全停止。'
+    return browser_override_reason(browser_launcher, config_dir)
+
 def auth_status(config_dir: str | None=None) -> dict:
     cb = claude_bin()
     if not cb:
         return {}
-    env = dict(os.environ)
+    from ccpick_coordination import child_environment, CoordinationError
+    try:
+        env = child_environment() or dict(os.environ)
+    except CoordinationError:
+        return {}
     if config_dir:
         env['CLAUDE_CONFIG_DIR'] = config_dir
     env['BROWSER'] = 'true'
@@ -139,6 +205,9 @@ def enroll_one(profile_dir: str, email: str | None, code_file: Path, config_dir:
     if not lp:
         b = Path.home() / '.local' / 'bin'
         return {'ok': False, 'reason': '找不到 ccpick 入口脚本（%s）。BROWSER 只能是单个可执行路径，没有回退形式，请先创建它。' % (b / ('ccpick.cmd' if sys.platform == 'win32' else 'ccpick'))}
+    override = browser_override_reason(lp, config_dir)
+    if override:
+        return {'ok': False, 'reason': override}
     before = auth_status(config_dir).get('email')
     env = dict(os.environ)
     env['CCPICK_PROFILE'] = profile_dir
@@ -412,7 +481,20 @@ def _render_auto_enroll_summary(results: list[dict], accounts: list[dict], accou
         for account in accounts:
             print('  %s. %s' % (account['slot'], account['email']))
 
+def _strict_enrollment_blocked() -> bool:
+    from ccpick_coordination import enabled, CoordinationError
+    try:
+        if not enabled():
+            return False
+        reason = 'strict_policy_enrollment_requires_maintenance'
+    except CoordinationError as error:
+        reason = str(error)
+    print(reason + ': 新增账号请先暂停使用并进入维护流程；当前仅支持已登录的本机账号池内切换。', file=sys.stderr)
+    return True
+
 def cmd_auto_enroll(args: list[str]) -> int:
+    if _strict_enrollment_blocked():
+        return 1
     import argparse
     ap = argparse.ArgumentParser(prog='ccpick auto-enroll')
     ap.add_argument('--profile', required=True, help='Chrome profile 目录名，如 Profile 4')
@@ -436,6 +518,10 @@ def cmd_auto_enroll(args: list[str]) -> int:
     if ns.user_agent and any((ord(c) < 32 or ord(c) == 127 for c in ns.user_agent)):
         print('--user-agent 含控制字符，拒绝。', file=sys.stderr)
         return 2
+    browser_error = enrollment_browser_preflight(ns.config_dir)
+    if browser_error:
+        print(browser_error, file=sys.stderr)
+        return 1
     from ccpick import list_profiles
     import ccpick_auto
     if ns.profile not in {profile['dir'] for profile in list_profiles()}:
@@ -482,6 +568,8 @@ def cmd_auto_enroll(args: list[str]) -> int:
     return 0
 
 def cmd_auto_enroll_all(args: list[str]) -> int:
+    if _strict_enrollment_blocked():
+        return 1
     import argparse
     ap = argparse.ArgumentParser(prog='ccpick auto-enroll-all')
     ap.add_argument('--profiles', nargs='+', help='配置文件目录名，可空格或逗号分隔')
@@ -543,6 +631,10 @@ def cmd_auto_enroll_all(args: list[str]) -> int:
         results = [results_by_dir[row['dir']] for row in preflight]
         _render_auto_enroll_summary(results, managed_rows, managed_error)
         return 2
+    browser_error = enrollment_browser_preflight(ns.config_dir)
+    if browser_error:
+        print(browser_error, file=sys.stderr)
+        return 1
     effective_config_dir = ns.config_dir or os.environ.get('CLAUDE_CONFIG_DIR')
     cs = cswap_bin()
     started = None
@@ -646,6 +738,8 @@ def cmd_auto_enroll_all(args: list[str]) -> int:
     return auto_enroll_batch_exit_code(len(attempts), failed, restore_failed or run_error is not None or final_accounts_error is not None)
 
 def cmd_enroll_all(args: list[str]) -> int:
+    if _strict_enrollment_blocked():
+        return 1
     import argparse
     ap = argparse.ArgumentParser(prog='ccpick enroll-all')
     ap.add_argument('--profiles', help='逗号分隔的配置文件目录名；不给则弹窗多选')
@@ -653,6 +747,10 @@ def cmd_enroll_all(args: list[str]) -> int:
     ap.add_argument('--no-add', action='store_true', help='只登录，不跑 cswap add')
     ap.add_argument('--timeout', type=int, default=CODE_WAIT_S, help='每个配置文件等你点授权的秒数（默认 %d）' % CODE_WAIT_S)
     ns = ap.parse_args(args)
+    browser_error = enrollment_browser_preflight(ns.config_dir)
+    if browser_error:
+        print(browser_error, file=sys.stderr)
+        return 1
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from ccpick import list_profiles
     profiles = list_profiles()
@@ -708,6 +806,8 @@ def cmd_enroll_all(args: list[str]) -> int:
     return 0 if len(ok) == len(results) else 1
 
 def cmd_enroll(args: list[str]) -> int:
+    if _strict_enrollment_blocked():
+        return 1
     import argparse
     ap = argparse.ArgumentParser(prog='ccpick enroll')
     ap.add_argument('--profile', help='Chrome 配置文件目录名，如 Default 或 "Profile 4"')
@@ -721,6 +821,10 @@ def cmd_enroll(args: list[str]) -> int:
     ns = ap.parse_args(args)
     if ns.config_dir and ns.add:
         ap.error('--config-dir cannot be combined with --add; isolated login must not change the default account store')
+    browser_error = enrollment_browser_preflight(ns.config_dir)
+    if browser_error:
+        print(browser_error, file=sys.stderr)
+        return 1
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from ccpick import list_profiles, pick_profile, PICK_CANCEL, PICK_DEFAULT
     profiles = list_profiles()
@@ -768,8 +872,9 @@ def cmd_enroll(args: list[str]) -> int:
                     cs = cswap_bin()
                     if cs:
                         print('[额度] 该账号现在不可用，切回 %s (%s)' % (back, bwhy))
-                        rr = subprocess.run([cs, 'switch', back], capture_output=True, text=True, timeout=180, encoding='utf-8', errors='replace')
-                        print((rr.stdout or rr.stderr or '').strip()[-200:])
+                        from ccpick_auto import switch_and_verify
+                        restored, detail = switch_and_verify(cs, back)
+                        print('[额度] ' + ('恢复已验证' if restored else detail))
                 else:
                     print('[额度] 警告：没有其它可用账号可切回 —— 当前身份用不了')
     return 0

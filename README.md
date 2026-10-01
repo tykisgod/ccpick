@@ -19,16 +19,16 @@ Read https://raw.githubusercontent.com/tykisgod/ccpick/main/AGENT_SETUP.md and i
 
 Chrome profile selection, usage visibility, and predictive account switching for people who use Claude Code with multiple accounts of their own.
 
-ccpick provides a command line, a Windows tray, and a macOS menu bar. It uses [claude-swap](https://github.com/realiti4/claude-swap) for credential storage and switching; the tested version is installed automatically in the same Python environment.
+ccpick provides a command line, a Windows tray, and a macOS menu bar. The existing mode uses [claude-swap](https://github.com/realiti4/claude-swap); an optional local runtime separates account credentials and native device identifiers while keeping managed conversations open during a switch.
 
-**Initial alpha release.** The package and decision logic run in CI on Windows, macOS, and Linux. Browser login and desktop startup still depend on your local Claude Code, Chrome, and OS permissions. Linux supports the command line; desktop services are Windows/macOS only.
+**Alpha release.** The package, decision logic, and local runtime fixtures run in CI on Windows, macOS, and Linux. Browser login and desktop startup still depend on your local Claude Code, Chrome, and OS permissions. The optional runtime and desktop services support Windows/macOS; Linux retains the existing CLI.
 
 ## Installation reference (for your agent)
 
 Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then:
 
 ```sh
-uv tool install --python 3.12 git+https://github.com/tykisgod/ccpick.git@v0.1.0
+uv tool install --python 3.12 git+https://github.com/tykisgod/ccpick.git@v0.2.0
 ccpick --help
 ccpick doctor
 ```
@@ -36,6 +36,28 @@ ccpick doctor
 Claude Code and Chrome must be installed separately. The Chrome profile picker also needs Python's Tk support; if your Python lacks it, use an interpreter with Tk via `uv tool install --python /path/to/python ...`, or select a profile explicitly with `CCPICK_PROFILE`.
 
 The package is distributed from this GitHub repository. It is not currently published to PyPI.
+
+## Optional independent account runtime
+
+Use this mode when you need separate account identities and account switching inside long-running Claude Code conversations. It needs Node.js 22+, native Claude Code, OpenSSL (included with Git for Windows), and a loopback HTTP CONNECT proxy that you configure yourself.
+
+```sh
+ccpick runtime setup --upstream-proxy http://127.0.0.1:8080 --dry-run
+ccpick runtime setup --upstream-proxy http://127.0.0.1:8080
+ccpick runtime add account@example.com
+ccpick run
+ccpick run -- --resume
+ccpick runtime status
+ccpick runtime doctor
+```
+
+Replace the example proxy with your own. Setup is explicit and leaves the global Claude launcher and existing account store intact. Launch managed conversations with `ccpick run`; ordinary unmanaged `claude` processes keep their existing behavior. Account selection, usage, and automatic decisions use the runtime after it is configured. `disable` marks an account as **manual only** in purple; you can still select it explicitly.
+
+The runtime binds each supported request to one account's credential and device ID together. In-flight requests finish with their original account; subsequent requests use the new selection. It preserves the native process, tool results, and stream instead of restarting the conversation or replaying a task. Shared transcript and input history keep Resume and the ↑ key available. Native `/login` in a managed conversation can authorize an existing or new account through the profile picker.
+
+Managed API, OAuth, token refresh, and usage requests use the configured proxy with no direct fallback. ccpick does not bundle a proxy service, VPN, residential gateway, or browser network configuration. Chrome's login-page traffic follows Chrome's own network settings; configure and verify that route separately if you require the same exit. The generated local certificate is trusted only by managed processes, without changing the OS or browser trust store.
+
+See [the runtime guide](RUNTIME.md) for supported features, migration, and troubleshooting. Hosted MCP, voice, cloud sessions, and remote control are outside this runtime's supported request paths. Tests use fake upstreams; real authorization and native end-to-end switching must be verified on the user's machine.
 
 ## Start with your existing accounts
 
@@ -47,7 +69,7 @@ ccpick usage --json
 ccpick auto --dry-run          # rank accounts without switching
 ccpick auto                   # select and verify an account
 ccpick switch 2               # explicitly select a saved account
-ccpick disable 2              # exclude an account from automatic selection
+ccpick disable 2              # manual only; explicit selection remains available
 ccpick enable 2
 ```
 
@@ -98,10 +120,10 @@ The decision engine considers both usage and the recent consumption rate. It che
 By default, account-wide 5-hour and 7-day windows drive selection. Per-model windows remain visible; include them explicitly when needed:
 
 ```sh
-ccpick auto --model Fable --dry-run
+ccpick auto --model MODEL_NAME --dry-run
 ```
 
-For background services, set the user environment variable `CCSWITCH_MODELS=Fable` (or `all`) before setup. Use the same setting across your shell and services.
+For background services, set `CCSWITCH_MODELS` to the desired model window name (or `all`) before setup. Use the same setting across your shell and services. `CCSWITCH_WATCH_ONLY=1` keeps scheduled checks observational. A pending automatic decision cannot overwrite a newer manual selection in runtime mode.
 
 ## Data and privacy
 
@@ -114,6 +136,7 @@ ccpick runs locally. It uses the installed Claude Code and claude-swap commands;
 | ccpick state on Linux | `${XDG_DATA_HOME:-~/.local/share}/ccpick/` |
 | claude-swap data on Windows/macOS | `~/.claude-swap-backup/` |
 | claude-swap data on Linux | `${XDG_DATA_HOME:-~/.local/share}/claude-swap/` |
+| Optional runtime account data | `<ccpick state>/profile-runtime/` |
 
 `CCPICK_DATA_DIR` overrides ccpick's state directory. Usage/status files can contain account email addresses. Do not attach them unredacted to issues, and never upload credentials or account exports. Existing claude-swap accounts are shared with ccpick; the dependency version is isolated, the account store is not.
 
@@ -124,6 +147,7 @@ python -m pip install -e .
 python tools/check_public.py
 python tools/test_package.py
 python tools/test_core.py
+python tools/test_profiles.py
 ```
 
 Tests use temporary homes and mocked account commands. They do not authorize a browser, switch real accounts, or install background services. CI also builds the package, parses PowerShell, compiles Swift on macOS, and scans Git history for secrets.

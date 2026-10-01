@@ -15,7 +15,10 @@ DEFAULT_MIN_GAIN = 10.0
 
 def _run(argv, timeout=180):
     try:
-        r = subprocess.run(argv, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout)
+        from ccpick_coordination import child_environment
+        environment = child_environment()
+        extra = {} if environment is None else {'env': environment}
+        r = subprocess.run(argv, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout, **extra)
         return (r.returncode, r.stdout or '', r.stderr or '')
     except Exception as e:
         return (-1, '', '%s: %s' % (type(e).__name__, e))
@@ -120,12 +123,13 @@ def slot_meta() -> dict:
     from ccpick_usage import collect
     out = {}
     for r in collect():
-        out[str(r['slot'])] = {'email': r['email'], 'active': r['active'], 'windows': r['windows'], 'error': r.get('error'), 'disabled': r.get('disabled', False)}
+        out[str(r['slot'])] = {'email': r['email'], 'active': r['active'], 'windows': r['windows'], 'error': r.get('error'), 'denied': r.get('denied'), 'autoSwitchEnabled': r.get('autoSwitchEnabled') is not False and (not r.get('disabled', False)), 'disabled': r.get('disabled', False)}
     return out
 
 def rank(probe: dict, meta: dict) -> list[dict]:
-    from ccpick_usage import fetch_error_kind, known_status
+    from ccpick_usage import DENIED_NOTE, capacity, fetch_error_kind, known_status, plan_info
     ks = known_status()
+    plans = plan_info()
     rows = []
     for slot, m in meta.items():
         p = probe.get(slot) or {}
@@ -137,8 +141,14 @@ def rank(probe: dict, meta: dict) -> list[dict]:
         st = ks.get(email, {})
         if m.get('disabled'):
             why_bad = 'Account disabled for automatic rotation'
+        elif m.get('autoSwitchEnabled') is False:
+            why_bad = '仅手动选择，不参与自动切换'
+        elif m.get('disabled'):
+            why_bad = 'Account disabled for automatic rotation'
         elif st.get('status') == 'account_on_hold':
             why_bad = '账号被 Anthropic 暂停（%s 实测），重新入库无效' % st.get('observed', '')
+        elif m.get('denied'):
+            why_bad = DENIED_NOTE + '；确认后 cswap remove'
         elif err == 'invalid_grant':
             why_bad = '凭据已失效，需要重新入库（ccpick enroll）'
         elif err == 'http-403':
@@ -159,9 +169,16 @@ def rank(probe: dict, meta: dict) -> list[dict]:
         scored = p.get('windows') or {}
         disp = {k: (v or {}).get('pct') for k, v in m['windows'].items()}
         disp.update({k: v for k, v in scored.items() if v is not None})
-        rows.append({'slot': slot, 'email': email, 'active': m['active'], 'headroom': hr, 'windows': scored, 'display': disp, 'resets': {k: (v or {}).get('in') for k, v in m['windows'].items()}, 'usable': why_bad is None, 'why_bad': why_bad, 'note': '上次取数 %s，用的是缓存里的数字' % err if why_bad is None and kind == 'transient' else None})
-    rows.sort(key=lambda r: (not r['usable'], -(r['headroom'] or 0) if r['usable'] else 0, int(r['slot']) if r['slot'].isdigit() else 999))
+        plan = plans.get(email.lower()) or {}
+        cap = capacity({k: v for k, v in scored.items() if v is not None}, plan.get('scale')) if hr is not None else None
+        rows.append({'slot': slot, 'email': email, 'active': m['active'], 'autoSwitchEnabled': m.get('autoSwitchEnabled') is not False, 'headroom': hr, 'cap': cap, 'plan': plan.get('plan') or '?', 'windows': scored, 'display': disp, 'resets': {k: (v or {}).get('in') for k, v in m['windows'].items()}, 'usable': why_bad is None, 'why_bad': why_bad, 'note': '上次取数 %s，用的是缓存里的数字' % err if why_bad is None and kind == 'transient' else None})
+    rows.sort(key=lambda r: (not r['usable'], -(_points(r) or 0) if r['usable'] else 0, int(r['slot']) if r['slot'].isdigit() else 999))
     return rows
+
+def _points(row: dict | None) -> float | None:
+    if not row:
+        return None
+    return row['cap'] if row.get('cap') is not None else row.get('headroom')
 
 def binding_reason(row: dict) -> str:
     w = row.get('windows') or {}
@@ -172,9 +189,28 @@ def binding_reason(row: dict) -> str:
     label = {'5h': '5 小时窗口', '7d': '周额度'}.get(k, k + ' 额度')
     return '%s用了 %.0f%%，是它最紧的一道' % (label, v)
 
-def switch_and_verify(cswap: str, email: str, timeout_s: int=25) -> tuple[bool, str]:
+def switch_and_verify(cswap: str, email: str, timeout_s: int=25, *, automatic: bool=False) -> tuple[bool, str]:
+    from ccpick_coordination import enabled, manual_switch, mutation_allowed, CoordinationError
+
+    def automatic_guard():
+        if not mutation_allowed('automatic'):
+            raise CoordinationError('watch_only_enabled')
+        target = next((row for row in slot_meta().values() if str(row.get('email') or '').casefold() == email.casefold()), None)
+        if target is None or target.get('autoSwitchEnabled') is False:
+            raise CoordinationError('automatic_target_disabled')
+    try:
+        if enabled():
+            options = {'target_guard': automatic_guard} if automatic else {}
+            return manual_switch(cswap, email, lambda: _switch_and_verify_uncoordinated(cswap, email, timeout_s)[0], **options)
+        if automatic:
+            automatic_guard()
+        return _switch_and_verify_uncoordinated(cswap, email, timeout_s)
+    except CoordinationError as error:
+        return (False, str(error))
+
+def _switch_and_verify_uncoordinated(cswap: str, email: str, timeout_s: int=25) -> tuple[bool, str]:
     from ccpick_enroll import auth_status
-    rc, out, err = _run([cswap, 'switch', email], timeout=180)
+    rc, out, err = _run([cswap, 'switch', email, '--json'], timeout=180)
     if rc != 0:
         return (False, 'cswap switch 失败（rc=%s）: %s' % (rc, (err or out).strip()[:200]))
     MIN_POLLS = 8
@@ -303,7 +339,7 @@ def render(rows: list[dict], src: str, fresh: str, model: str | None) -> str:
     out.append('账号自动挑选        余量 = 算数的闸里剩得最少的那个；右边 5h/7d/%s 三列是【已用】%%' % show)
     out.append('数据: %s ｜ %s' % (src, fresh))
     out.append('=' * 76)
-    out.append('  余量  账号                            5h    7d   %-5s 备注' % show)
+    out.append('  额度点 余量  账号                            5h    7d   %-5s 备注（额度点 = 一个 5x 号 5 小时窗口的 1%%，按套餐折算）' % show)
     for r in rows:
         w = r['display']
         mark = '←当前' if r['active'] else ''
@@ -316,9 +352,10 @@ def render(rows: list[dict], src: str, fresh: str, model: str | None) -> str:
             scored = {k: v for k, v in (r.get('windows') or {}).items() if v is not None}
             k_bind = max(scored, key=scored.get) if scored else None
             hidden = '  卡在 %s %.0f%%' % (k_bind, scored[k_bind]) if k_bind and k_bind not in ('5h', '7d', show) else ''
-            out.append('  %4.0f%%  %-30s %s %s %s %s%s%s%s' % (r['headroom'], r['email'], pc('5h'), pc('7d'), pc(show), mark, best, hidden, '  （%s）' % r['note'] if r.get('note') else ''))
+            plan = r.get('plan')
+            out.append('  %5s %4.0f%%  %-30s %s %s %s %s%s%s%s%s' % ('%.0f' % r['cap'] if r.get('cap') is not None else '—', r['headroom'], r['email'], pc('5h'), pc('7d'), pc(show), '%s ' % plan if plan and plan != '?' else '', mark, best, hidden, '  （%s）' % r['note'] if r.get('note') else ''))
         else:
-            out.append('     —   %-30s %s%s' % (r['email'], r['why_bad'], '  ' + mark if mark else ''))
+            out.append('      —     —   %-30s %s%s' % (r['email'], r['why_bad'], '  ' + mark if mark else ''))
     return '\n'.join(out)
 
 def cmd_auto(args: list[str]) -> int:
@@ -326,12 +363,36 @@ def cmd_auto(args: list[str]) -> int:
     ap = argparse.ArgumentParser(prog='ccpick auto', description='切到现在最该用的那个账号')
     ap.add_argument('--dry-run', action='store_true', help='只报告，不切')
     ap.add_argument('--model', help='把这些按模型的周额度也算进余量，如 Fable 或 all（默认看 CCSWITCH_MODELS，不设就只算 5h/7d）')
-    ap.add_argument('--min-gain', type=float, default=DEFAULT_MIN_GAIN, help='余量至少高这么多个点才值得切（默认 %.0f）' % DEFAULT_MIN_GAIN)
+    ap.add_argument('--min-gain', type=float, default=DEFAULT_MIN_GAIN, help='至少多这么多额度点才值得切（默认 %(default).0f；1 点 = 5x 号 5h 窗口的 1%%）')
     ap.add_argument('--max-age', type=float, default=DEFAULT_MAX_AGE_S, help='缓存超过这么多秒就先刷新（默认 %d）' % DEFAULT_MAX_AGE_S)
     ap.add_argument('--no-refresh', action='store_true', help='不刷新，直接用现成缓存')
     ap.add_argument('--enroll', action='store_true', help='一个能用的都没有时，自动跑一次入库（会开浏览器）')
     ap.add_argument('--json', action='store_true', help='机器可读')
+    ap.add_argument('--force', action='store_true', help='只看不切开着时也照样切 (那是人手动决定的; 自动流程别加它)')
     ns = ap.parse_args(args)
+    from ccpick_coordination import enabled, run_auto, CoordinationError
+    try:
+        if enabled():
+            if ns.enroll:
+                raise CoordinationError('quota_only_does_not_enroll_accounts')
+            old_models = os.environ.get('CCSWITCH_MODELS')
+            try:
+                if ns.model is not None:
+                    os.environ['CCSWITCH_MODELS'] = ns.model
+                result = run_auto(dry_run=ns.dry_run or ns.no_refresh, refresh_usage=not ns.no_refresh)
+            finally:
+                if old_models is None:
+                    os.environ.pop('CCSWITCH_MODELS', None)
+                else:
+                    os.environ['CCSWITCH_MODELS'] = old_models
+            if ns.json:
+                print(json.dumps(result, ensure_ascii=False))
+            else:
+                print(result.get('why', result['action']))
+            return {'switched': 0, 'would-switch': 0, 'stay': 2, 'blocked': 3}.get(result['action'], 1)
+    except CoordinationError as error:
+        print(json.dumps({'action': 'error', 'why': str(error)}) if ns.json else str(error))
+        return 1
     from ccpick_enroll import cswap_bin
     from ccpick_usage import collect, snapshot
     res = {}
@@ -382,31 +443,46 @@ def cmd_auto(args: list[str]) -> int:
         say('下一步：ccpick auto --enroll   （会开浏览器走一次授权）')
         return finish(3)
     cur_hr = cur['headroom'] if cur and cur['usable'] else None
+    cur_pts = _points(cur) if cur and cur['usable'] else None
+    best_pts = _points(best)
+
+    def pts(r, p):
+        return '折 %.0f 点' % r['cap'] if r.get('cap') is not None else '余量 %.0f%%' % p
     if cur and best['email'] == cur['email']:
-        res.update(action='no-switch', reason='already-best', headroom=best['headroom'])
-        say('已经在最优账号上：%s（余量 %.0f%%）' % (cur['email'], best['headroom']))
+        res.update(action='no-switch', reason='already-best', headroom=best['headroom'], cap=best.get('cap'))
+        say('已经在最优账号上：%s（%s，余量 %.0f%%）' % (cur['email'], pts(best, best['headroom']), best['headroom']))
         say('   %s' % binding_reason(best))
         return finish(2)
-    gain = best['headroom'] - cur_hr if cur_hr is not None else None
+    gain = best_pts - cur_pts if cur_pts is not None else None
     if gain is not None and gain < ns.min_gain:
         res.update(action='no-switch', reason='gain-too-small', gain=gain, min_gain=ns.min_gain)
-        say('当前 %s（余量 %.0f%%）与最优 %s（%.0f%%）只差 %.0f 个点，不值得折腾。' % (cur['email'], cur_hr, best['email'], best['headroom'], gain))
+        say('当前 %s（%s）与最优 %s（%s）只差 %.0f，不值得折腾。' % (cur['email'], pts(cur, cur_hr), best['email'], pts(best, best['headroom']), gain))
         say('   要切就加 --min-gain 0')
         return finish(2)
     frm = cur['email'] if cur else None
     res.update(action='switch', **{'from': frm, 'to': best['email'], 'gain': gain, 'why': binding_reason(best)})
     say('决定: %s  →  %s' % (frm or '(读不到当前身份)', best['email']))
-    say('      余量 %s → %.0f%%%s' % ('%.0f%%' % cur_hr if cur_hr is not None else '(当前账号不可用)', best['headroom'], '  (+%.0f)' % gain if gain is not None else ''))
+    say('      %s → %s%s' % (pts(cur, cur_hr) if cur_pts is not None else '(当前账号不可用)', pts(best, best['headroom']), '  (+%.0f)' % gain if gain is not None else ''))
     say('      理由: %s' % binding_reason(best))
     if ns.dry_run:
         res.update(action='dry-run')
         say('（--dry-run，没有真的切）')
         return finish(0)
+    from ccpick_usage import watch_only
+    if watch_only() and (not ns.force):
+        res.update(action='watch-only')
+        say('（只看不切开着，没有切。要换请手动: cswap switch %s，或 ccpick auto --force）' % best['email'])
+        return finish(2)
     if not cswap:
         res.update(action='error', reason='找不到 cswap')
         say('找不到 cswap，无法切换。', file=sys.stderr)
         return finish(1)
-    ok, why = switch_and_verify(cswap, best['email'])
+    target = slot_meta().get(str(best['slot']))
+    if not target or target.get('email') != best['email'] or target.get('autoSwitchEnabled') is False:
+        res.update(action='no-target', reason='automatic_target_disabled')
+        say('目标账号已移除或设为仅手动，本次自动切换已取消。')
+        return finish(3)
+    ok, why = switch_and_verify(cswap, best['email'], automatic=True)
     res.update(verified=ok, verify_detail=why)
     say('切换: %s' % why)
     if not ok:
@@ -418,6 +494,11 @@ def cmd_auto(args: list[str]) -> int:
     return finish(0)
 
 def _enroll_fallback(rows: list[dict], say=print) -> tuple[int, str]:
+    from ccpick_enroll import enrollment_browser_preflight
+    browser_error = enrollment_browser_preflight()
+    if browser_error:
+        say(browser_error)
+        return (1, browser_error)
     from ccpick import list_profiles
     from ccpick_usage import known_status
     known = {r['email'] for r in rows if r['email']}

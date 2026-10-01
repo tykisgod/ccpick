@@ -15,6 +15,9 @@ HELP = """ccpick — Claude account switching and Chrome profile selection
   ccpick setup [--autoswitch]       Configure Claude's browser and optional service
   ccpick uninstall                 Remove ccpick's integration (keep account data)
   ccpick doctor                    Check installation without logging in or switching
+  ccpick runtime setup [...]       Opt in to the isolated local account runtime
+  ccpick runtime add --email EMAIL  Enroll a new isolated account manually
+  ccpick run -- CLAUDE_ARGUMENTS    Run Claude in the managed terminal/process tree
   ccpick list                      List Chrome profiles
   ccpick accounts [--json]          Refresh and list managed accounts
   ccpick status                    Show the backend's current account
@@ -87,6 +90,10 @@ def _login(args: list[str]) -> int:
     launcher = runtime.launcher_path()
     if not executable or not launcher:
         raise RuntimeError("Claude Code and the installed ccpick console command are required.")
+    browser_error = ccpick_enroll.browser_override_reason(launcher)
+    if browser_error:
+        print(browser_error, file=sys.stderr)
+        return 1
     if ns.profile and ns.profile not in {p["dir"] for p in ccpick.list_profiles()}:
         parser.error("Unknown Chrome profile; run ccpick list.")
     env = dict(os.environ, BROWSER=launcher)
@@ -109,6 +116,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     cmd, tail = args[0], args[1:]
     try:
+        if cmd == "runtime":
+            from .runtime_profiles import main as runtime_main
+            return runtime_main(tail)
+        if cmd == "run":
+            from .runtime_profiles import main as runtime_main
+            return runtime_main(["run", *tail])
+        if cmd in ("auto-enroll", "autoenroll", "auto-enroll-all", "autoenrollall"):
+            from . import runtime_profiles
+            if runtime_profiles.enabled():
+                raise RuntimeError("Runtime mode uses manual scoped enrollment: ccpick runtime add EMAIL")
         if cmd == "setup":
             from .setup import cmd_setup
             return cmd_setup(tail)
@@ -120,6 +137,19 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_autoswitch(tail)
         if cmd == "doctor":
             return doctor(tail)
+        if cmd in ("accounts", "status", "usage", "quota", "switch", "disable", "enable", "add", "remove", "login", "enroll", "auto-policy"):
+            from . import runtime_profiles
+            if runtime_profiles.enabled():
+                if cmd in ("add", "enroll"):
+                    return runtime_profiles.main(["add", *tail])
+                if cmd == "login":
+                    return runtime_profiles.main(["login", *tail])
+                return runtime_profiles.dispatch("ccpick", [cmd, *tail])
+        if cmd == "switch":
+            runtime.bootstrap()
+            from ccpick_coordination import enabled, cmd_switch
+            if enabled():
+                return cmd_switch(tail)
         if cmd in ("accounts", "status", "switch", "add", "disable", "enable", "remove"):
             return backend.run(["list" if cmd == "accounts" else cmd, *tail]).returncode
         runtime.bootstrap()
@@ -130,6 +160,9 @@ def main(argv: list[str] | None = None) -> int:
             from ccpick_usage import cmd_usage
             return cmd_usage(tail)
         if cmd == "auto":
+            from . import runtime_profiles
+            if runtime_profiles.enabled():
+                return runtime_profiles.main(["auto", *tail])
             from ccpick_auto import cmd_auto
             return cmd_auto(tail)
         if cmd == "login":
@@ -147,9 +180,15 @@ def main(argv: list[str] | None = None) -> int:
             from ccpick_js_gate import cmd_enable_js_gate
             return cmd_enable_js_gate(tail)
         if cmd == "--url-stdin":
+            if os.environ.get("CCPICK_ACCOUNT_RUNTIME") == "1":
+                from .runtime_profiles import browser
+                return browser(sys.stdin.readline().rstrip("\n"))
             import ccpick
             return ccpick.handle_url(sys.stdin.readline().rstrip("\n"))
         if urlparse(cmd).scheme.lower() in ("http", "https") and len(args) == 1:
+            if os.environ.get("CCPICK_ACCOUNT_RUNTIME") == "1":
+                from .runtime_profiles import browser
+                return browser(cmd)
             import ccpick
             if (sys.platform in ("darwin", "win32") and not os.environ.get(ccpick.ENV_DETACHED_PICKER)
                     and not os.environ.get(ccpick.ENV_PROFILE) and ccpick.is_claude_auth_url(cmd)

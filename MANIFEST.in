@@ -1,0 +1,5 @@
+include AGENT_SETUP.md AGENTS.md CHANGELOG.md README.zh-CN.md RUNTIME.md uv.lock
+recursive-include assets *.png
+recursive-include tools *.py
+recursive-include tests *.py
+recursive-include src/ccpick_app/profile_runtime *.mjs *.py

@@ -2,7 +2,7 @@
 
 This is the installation playbook for an agent working on the user's computer. Follow it when the user asks you to set up ccpick. For repository development instead, use [AGENTS.md](AGENTS.md).
 
-Target release: **v0.1.0 (alpha)**, Python **3.12+**, automatically installed backend **claude-swap 0.26.0**. Background integration supports Windows and macOS; Linux supports the command line. Reply in the user's language.
+Target release: **v0.2.0 (alpha)**, Python **3.12+**, automatically installed backend **claude-swap 0.26.0**. Background integration and the optional independent account runtime support Windows/macOS; Linux supports the existing command line. Reply in the user's language.
 
 ## Working agreement
 
@@ -25,7 +25,7 @@ Resolve missing prerequisites using their official instructions: [uv installatio
 Install a persistent tool environment, outside a Git checkout:
 
 ```sh
-uv tool install --python 3.12 git+https://github.com/tykisgod/ccpick.git@v0.1.0
+uv tool install --python 3.12 git+https://github.com/tykisgod/ccpick.git@v0.2.0
 ```
 
 If this exact public release is already installed, reuse it. If an existing tool must be updated, inspect its origin first; use uv's reinstall option only as part of the requested update. Do not overwrite a different installation just to make the command succeed. Do not install a separate global `cswap`, use an editable checkout, or launch background services through `uv run`.
@@ -54,7 +54,15 @@ Check the doctor's `ccpick`, `python`, `launcher`, `backend_version`, `backend_r
 
 `doctor` is read-only. Its `ok` result checks prerequisites, not successful login, usable quota, a running service, or even the presence of accounts. `autoswitch_status_present` means only that a file exists.
 
-## 3. Use existing accounts first
+## 3. Choose the account backend and use existing accounts first
+
+The existing credential backend remains the default. If the user requested independent device identifiers, preserved conversations during switching, or the new runtime, read [RUNTIME.md](RUNTIME.md) and configure it explicitly before enrolling accounts or starting automatic switching. This needs Node.js 22+, native Claude Code, OpenSSL, and a user-provided loopback HTTP CONNECT proxy. Request the proxy choice if it is missing; do not invent a network route or copy another installation's private settings.
+
+Preview `ccpick runtime setup --upstream-proxy <USER_PROXY> --dry-run`, then apply it within the user's request. Resolve the native executable and use `--native` if PATH points to a wrapper. Setup does not import the old account store. Authorize runtime accounts with `ccpick runtime add --email account@example.com`, then launch new managed conversations with `ccpick run`. Existing unmanaged Claude windows remain outside runtime mode until the user exits them normally and resumes them through that launcher.
+
+Confirm the browser's own network route separately if the user requires a particular exit; process proxy variables do not configure Chrome. Runtime API/OAuth/refresh/usage transport uses the supplied CONNECT proxy without direct fallback. Use manual authorization for runtime enrollment; legacy automatic enrollment commands do not update its separate store.
+
+The remaining enrollment instructions in this section apply to the existing backend. Desktop setup in section 4 can be used for either backend after its accounts are ready.
 
 Inspect `ccpick accounts` and `ccpick list` locally. The first lists managed accounts; the second lists Chrome profiles. Preserve disabled accounts and the current active account. Do not enable, remove, or switch accounts merely to test installation.
 

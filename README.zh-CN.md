@@ -19,16 +19,16 @@
 
 给持有多个本人账号的 Claude Code 用户用的工具：登录时选择 Chrome 配置文件、查看额度与恢复时间、按消耗速度预测并切换账号，配有 Windows 托盘和 macOS 菜单栏。
 
-底层凭据管理和切换由 [claude-swap](https://github.com/realiti4/claude-swap) 完成。安装 ccpick 时自动装好锁定版本，日常操作都通过 `ccpick` 命令完成。
+原有模式使用 [claude-swap](https://github.com/realiti4/claude-swap)。新的可选本地运行层会分别保存账号认证和原生设备标识，让受控 Claude 对话在切号后继续使用原进程。日常操作仍通过 `ccpick` 完成。
 
-这是首个 alpha 版本。Windows、macOS、Linux 在 CI 中验证包安装和决策逻辑；实际浏览器登录、自启和系统权限仍需在使用者机器上验证。Linux 第一版只提供命令行。
+这是 alpha 版本。Windows、macOS、Linux 在 CI 中验证包、决策和本地运行层的合成测试；实际登录、自启和系统权限仍需在使用者机器上验证。独立运行层和桌面服务支持 Windows/macOS，Linux 保留原有命令行功能。
 
 ## 安装参考（供 agent 使用）
 
 先安装 [uv](https://docs.astral.sh/uv/getting-started/installation/)，然后执行：
 
 ```sh
-uv tool install --python 3.12 git+https://github.com/tykisgod/ccpick.git@v0.1.0
+uv tool install --python 3.12 git+https://github.com/tykisgod/ccpick.git@v0.2.0
 ccpick --help
 ccpick doctor
 ```
@@ -36,6 +36,28 @@ ccpick doctor
 需要另外安装 Claude Code 和 Chrome。弹窗选号需要 Python 的 Tk 支持；如果当前解释器没有 Tk，可以通过 `uv tool install --python /path/to/python ...` 指定带 Tk 的解释器，或设置 `CCPICK_PROFILE` 直接指定配置文件。
 
 当前通过 GitHub 分发，尚未发布到 PyPI。
+
+## 可选：独立账号运行层
+
+需要独立账号标识，并希望长任务在切号后继续时，可以显式启用。依赖 Node.js 22+、原生 Claude Code、OpenSSL（Git for Windows 自带），以及自行配置的本地 HTTP CONNECT 代理。
+
+```sh
+ccpick runtime setup --upstream-proxy http://127.0.0.1:8080 --dry-run
+ccpick runtime setup --upstream-proxy http://127.0.0.1:8080
+ccpick runtime add account@example.com
+ccpick run
+ccpick run -- --resume
+ccpick runtime status
+ccpick runtime doctor
+```
+
+示例代理地址要换成自己的。安装不会覆盖全局 Claude 启动器或旧账号库。使用 `ccpick run` 打开受控对话；普通 `claude` 进程仍沿用原来的配置。启用后，账号选择、额度和自动决策接入新运行层。`disable` 会显示紫色“仅手动”标记，仍可手动切过去。
+
+每个受支持的请求使用同一账号的认证和设备标识。已经发出的请求按原账号完成，后续请求使用新选择；对话保留原进程、工具结果和流式响应，不重启或重复任务。正文与输入历史共享，Resume 和 ↑ 历史可以继续使用。受控对话里的原生 `/login` 通过浏览器配置文件选择器授权，可识别已有或新账号。
+
+API、OAuth、刷新认证和额度请求都走配置的代理，失败时不会回退直连。项目不自带代理、VPN、家宽出口或浏览器网络配置；Chrome 登录页面仍按 Chrome 自身设置联网，需要相同出口时要另外配置并核验。生成的本地证书仅供受控进程信任，不修改系统或浏览器证书库。
+
+详见 [运行层说明](RUNTIME.md)。托管 MCP、语音、云端会话、远程控制不在新运行层支持范围内。CI 使用合成上游，真实授权与原生切号还需要在使用者机器上验证。
 
 ## 日常使用
 
@@ -48,7 +70,7 @@ ccpick usage --json
 ccpick auto --dry-run          # 看建议，不切换
 ccpick auto                   # 选择账号并核对切换结果
 ccpick switch 2               # 指定账号
-ccpick disable 2              # 停用该账号的自动选择
+ccpick disable 2              # 仅手动，仍可指定切换
 ccpick enable 2
 ```
 
@@ -96,11 +118,13 @@ uv tool uninstall ccpick
 
 决策同时考虑用量与最近的消耗速度；接近耗尽时缩短检查间隔，离开耗尽账号后等其恢复再重新考虑。取数失败不当成零用量，停用或已删除的账号不会成为自动切换目标。
 
-默认只用账号级 5 小时、7 天窗口决定切换。每模型额度照样展示，需要时用 `ccpick auto --model Fable` 纳入判据；后台服务使用用户环境变量 `CCSWITCH_MODELS=Fable` 或 `all`，设置后重新运行 setup。
+默认只用账号级 5 小时、7 天窗口决定切换。每模型额度照样展示，需要时用 `ccpick auto --model MODEL_NAME` 纳入判据；后台服务使用 `CCSWITCH_MODELS` 指定窗口名或 `all`，设置后重新运行 setup。`CCSWITCH_WATCH_ONLY=1` 让后台只检查。新运行层会拒绝已过期的自动决策，避免覆盖后来的人为选择。
 
 ccpick 状态目录：Windows 为 `%LOCALAPPDATA%/ccpick/`，macOS 为 `~/Library/Application Support/ccpick/`，Linux 为 `${XDG_DATA_HOME:-~/.local/share}/ccpick/`。可用 `CCPICK_DATA_DIR` 覆盖。
 
 claude-swap 的账号库仍用它原来的路径，与已有 claude-swap 共用；依赖版本在独立环境里，账号数据不是另建一份。状态与日志可能包含邮箱，发 issue 前请脱敏，不要上传凭据或账号导出文件。程序没有遥测或托管服务。
+
+启用可选运行层后，其账号库保存在 `<ccpick 状态目录>/profile-runtime/`，与旧账号库分开。安装不会导入旧认证；请在新运行层完成各账号的官方授权。
 
 本项目是独立的非官方工具，与 Anthropic 无关联。请只管理本人有权访问的账号，并遵守所用服务的条款。工具不会改变订阅额度。
 

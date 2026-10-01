@@ -1,11 +1,113 @@
 from __future__ import annotations
 from ccpick_app import runtime as _runtime, backend as _backend
 import json
+import datetime
+import math
+import hashlib
 import os
+import random
 import sys
 import time
 from pathlib import Path
 CCPICK = _runtime.legacy_dir()
+
+def _wait_context() -> str | None:
+    return _runtime.wait_context()
+
+def _save_wait_status(dest: Path, payload: dict) -> None:
+    tmp = dest.with_name(dest.name + '.tmp.%s' % os.getpid())
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
+        os.replace(tmp, dest)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+def cmd_defer(argv: list[str]) -> int:
+    result = json.loads(sys.stdin.read().lstrip('\ufeff'))
+    if result.get('action') != 'blocked' or any((result.get(k) for k in ('activeDenied', 'deniedFrom', 'denyUnsure', 'switchFailed'))):
+        return 1
+    try:
+        retry = datetime.datetime.fromisoformat((result.get('soonestAt') or '').replace('Z', '+00:00')).timestamp()
+    except (ValueError, TypeError):
+        return 1
+    if not math.isfinite(retry) or retry <= time.time():
+        return 1
+    dest = Path(argv[0])
+    payload = json.loads(dest.read_text(encoding='utf-8'))
+    if payload.get('state') != 'blocked':
+        return 1
+    payload['retryAt'] = retry + 60
+    payload['waitKind'] = 'quota'
+    payload['waitContext'] = _wait_context()
+    payload['lastUsageCheckAt'] = payload.get('ts')
+    _save_wait_status(dest, payload)
+    return cmd_wait(argv)
+
+def monitor_interval(result: dict) -> float | None:
+    if not result.get('watchOnly') or result.get('action') != 'stay' or any((result.get(k) for k in ('activeDenied', 'currentDenied', 'deniedFrom', 'denyUnsure', 'switchFailed'))):
+        return None
+    try:
+        used = float(result['used'])
+        rate = float(result.get('burnRate') or 0)
+    except (KeyError, ValueError, TypeError):
+        return None
+    if not math.isfinite(used) or not 0 <= used <= 100 or (not math.isfinite(rate)):
+        return None
+    interval = 1800 if used < 50 else 600 if used < 80 else 120 if used < 90 else 60
+    rate_limit = math.inf
+    if rate > 0:
+        gate = 80 if used < 80 else 90 if used < 90 else 100
+        rate_limit = max(20, (gate - used) / rate * 60 / 4)
+        interval = min(interval, rate_limit)
+    if result.get('urgent') or result.get('wouldSwitchTo'):
+        interval = min(interval, 60)
+    if interval == 1800:
+        interval = min(random.uniform(1620, 1980), rate_limit)
+    return interval
+
+def cmd_schedule(argv: list[str]) -> int:
+    result = json.loads(sys.stdin.read().lstrip('\ufeff'))
+    interval = monitor_interval(result)
+    if interval is None:
+        return 1
+    dest = Path(argv[0])
+    payload = json.loads(dest.read_text(encoding='utf-8'))
+    if payload.get('state') not in ('ok', 'advise'):
+        return 1
+    payload['retryAt'] = time.time() + interval
+    payload['waitKind'] = 'monitor'
+    payload['waitContext'] = _wait_context()
+    payload['lastUsageCheckAt'] = payload.get('ts')
+    payload['waitExtra'] = payload.get('extra', '')
+    _save_wait_status(dest, payload)
+    return cmd_wait(argv)
+
+def cmd_wait(argv: list[str]) -> int:
+    dest = Path(argv[0])
+    try:
+        payload = json.loads(dest.read_text(encoding='utf-8'))
+        retry = float(payload.get('retryAt', 0))
+    except (OSError, ValueError, TypeError):
+        return 1
+    kind = payload.get('waitKind', 'quota')
+    valid_states = ('blocked',) if kind == 'quota' else ('ok', 'advise') if kind == 'monitor' else ()
+    if payload.get('state') not in valid_states or not math.isfinite(retry) or retry <= time.time():
+        return 1
+    context = _wait_context()
+    if context is None or (payload.get('waitContext') is not None and payload['waitContext'] != context):
+        return 1
+    payload['waitContext'] = context
+    when = datetime.datetime.fromtimestamp(retry).strftime('%m-%d %H:%M')
+    payload['ts'] = time.time()
+    if kind == 'quota':
+        payload['message'] = '等待额度恢复'
+        payload['extra'] = '已暂停联网检查，%s 再查；额度为上次查询结果' % when
+    else:
+        payload['extra'] = '%s · %s 再查（额度为上次查询结果）' % (payload.get('waitExtra', ''), when)
+    payload['nextCheckS'] = max(20, min(300, retry - time.time()))
+    _save_wait_status(dest, payload)
+    return 0
 _USAGE_NEEDS = ('collect', 'is_usable', 'is_blocked', 'counted_windows', 'counts_toward_limit')
 
 def _load_usage():
@@ -24,9 +126,16 @@ def _load_usage():
             why_not.append('%s (读不了: %s)' % (src, type(e).__name__))
             continue
         missing = [n for n in _USAGE_NEEDS if not hasattr(mod, n)]
+        if sys.platform == 'darwin' and (not hasattr(mod, 'prepare_coordination_import')):
+            missing.append('prepare_coordination_import')
         if missing:
             why_not.append('%s (太旧, 缺 %s)' % (src, ', '.join(missing)))
             continue
+        if sys.platform == 'darwin':
+            try:
+                mod.prepare_coordination_import()
+            except OSError as e:
+                return (None, '%s (ccpick 安装不可用: %s)' % (src, type(e).__name__))
         return (mod, '')
     return (None, '; '.join(why_not))
 
@@ -72,6 +181,8 @@ def cmd_write(argv: list[str]) -> int:
     payload['etaS'] = _num(sp[1]) if len(sp) > 1 else None
     payload['burnRate'] = _num(sp[2]) if len(sp) > 2 else None
     payload['activeEmail'] = (sp[3] if len(sp) > 3 else '') or None
+    decision_action = sp[4] if len(sp) > 4 else None
+    payload['decisionAction'] = decision_action if decision_action in ('stay', 'switched', 'would-switch', 'blocked', 'error') else None
     try:
         payload['threshold'] = float(thr)
     except (TypeError, ValueError):
@@ -131,6 +242,8 @@ def cmd_earliest(_argv: list[str]) -> int:
         return 1
     best = None
     for row in mod.collect():
+        if row.get('autoSwitchEnabled') is False:
+            continue
         windows = row.get('windows') or {}
         for key in ('5h', '7d'):
             win = windows.get(key) or {}
@@ -168,14 +281,21 @@ def cmd_accounts(_argv: list[str]) -> int:
     cached = _active_email_from_status()
     if cached:
         mod.live_identity = lambda *a, **k: cached
+    cap_fn = getattr(mod, 'capacity', None)
+    try:
+        plans = mod.plan_info() if hasattr(mod, 'plan_info') else {}
+    except Exception:
+        plans = {}
     rows = []
     newest = None
     for row in mod.collect():
         windows = row.get('windows') or {}
         wins = []
+        unavailable = []
         for key in ('5h', '7d'):
             w = windows.get(key) or {}
             if w.get('pct') is None:
+                unavailable.append({'name': key, 'status': 'expired' if w.get('expired') else 'missing'})
                 continue
             wins.append({'name': key, 'used': float(w['pct']), 'at': w.get('at') or '', 'in': w.get('in') or ''})
         for key, w in windows.items():
@@ -191,16 +311,29 @@ def cmd_accounts(_argv: list[str]) -> int:
             newest = float(fetched)
         ok, why = mod.is_usable(row)
         blocked, blocked_why = mod.is_blocked(row)
-        rows.append({'slot': row.get('slot'), 'email': row.get('email') or '?', 'active': bool(row.get('active')), 'headroom': None if worst is None else 100.0 - worst, 'windows': wins, 'usable': bool(ok), 'why': why, 'blocked': bool(blocked), 'blockedWhy': blocked_why})
-    rows.sort(key=lambda r: (not r['usable'], r['headroom'] is None, -(r['headroom'] or 0.0)))
+        plan = plans.get(str(row.get('email') or '').lower()) or {}
+        cap = cap_fn(counted, plan.get('scale')) if cap_fn and counted else None
+        rows.append({'slot': row.get('slot'), 'email': row.get('email') or '?', 'active': bool(row.get('active')), 'autoSwitchEnabled': row.get('autoSwitchEnabled') is not False, 'headroom': None if worst is None else 100.0 - worst, 'cap': None if cap is None else round(cap, 1), '_err': row.get('error'), '_disabled': bool(row.get('disabled')), 'plan': plan.get('plan') or '?', 'windows': wins, 'unavailableWindows': unavailable, 'usable': bool(ok), 'why': why, 'blocked': bool(blocked), 'blockedWhy': blocked_why})
+    kind = getattr(mod, 'fetch_error_kind', None)
+
+    def _pts(r):
+        return r['cap'] if r['cap'] is not None else r['headroom']
+
+    def _sink(r):
+        return r['blocked'] or r.get('_disabled') or (kind is not None and kind(r.get('_err')) == 'unknown')
+    rows.sort(key=lambda r: (not r['autoSwitchEnabled'], _sink(r), _pts(r) is None, -(_pts(r) or 0.0)))
+    for r in rows:
+        r.pop('_err', None)
+        r.pop('_disabled', None)
     print(json.dumps({'fetchedAt': newest, 'accounts': rows}, ensure_ascii=False))
     return 0
 
 def main() -> int:
+    sys.path.insert(0, str(CCPICK))
     if len(sys.argv) < 2:
         print(__doc__, file=sys.stderr)
         return 2
-    table = {'write': cmd_write, 'used': cmd_used, 'earliest': cmd_earliest, 'accounts': cmd_accounts}
+    table = {'write': cmd_write, 'used': cmd_used, 'earliest': cmd_earliest, 'accounts': cmd_accounts, 'defer': cmd_defer, 'wait': cmd_wait, 'schedule': cmd_schedule}
     fn = table.get(sys.argv[1])
     if fn is None:
         print('未知子命令: %s' % sys.argv[1], file=sys.stderr)

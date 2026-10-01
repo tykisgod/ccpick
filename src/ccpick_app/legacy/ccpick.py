@@ -265,10 +265,16 @@ def claim_login_profile(max_age_s: float=PENDING_LOGIN_MAX_AGE_S) -> str | None:
 
 def account_usage_index() -> tuple[dict, float | None]:
     try:
+        import ccpick_usage as _usage
         from ccpick_usage import collect, counted_windows
         rows = collect()
     except Exception:
         return ({}, None)
+    cap_fn = getattr(_usage, 'capacity', None)
+    try:
+        plans = _usage.plan_info() if hasattr(_usage, 'plan_info') else {}
+    except Exception:
+        plans = {}
     index: dict = {}
     newest: float | None = None
     for r in rows or []:
@@ -294,7 +300,14 @@ def account_usage_index() -> tuple[dict, float | None]:
         fetched = r.get('fetched_at')
         if isinstance(fetched, (int, float)) and (newest is None or fetched > newest):
             newest = float(fetched)
-        index[email] = {'headroom': min(remaining) if remaining else None, 'binding': binding[1] if binding else None, 'resets': binding[2] if binding else '', 'error': r.get('error')}
+        pcts = {k: (w or {}).get('pct') for k, w in counted.items() if isinstance(w, dict) and (w or {}).get('pct') is not None}
+        cap = None
+        if cap_fn and pcts:
+            try:
+                cap = cap_fn(pcts, (plans.get(email) or {}).get('scale'))
+            except Exception:
+                cap = None
+        index[email] = {'headroom': min(remaining) if remaining else None, 'cap': cap, 'binding': binding[1] if binding else None, 'resets': binding[2] if binding else '', 'error': r.get('error')}
     return (index, newest)
 
 def _usage_age_text(fetched_at: float | None) -> str:
@@ -321,17 +334,21 @@ def _annotate_profiles(profiles: list[dict]) -> tuple[list[dict], str]:
         email = mapping.get(p.get('dir') or '') or google
         info = index.get(email) if email else None
         hr = info.get('headroom') if info else None
+        cap = info.get('cap') if info else None
         if info is None:
             note = '未入库'
         elif hr is None:
             note = '额度未知'
         else:
-            note = '余量 %.0f%%' % hr
+            note = '折 %.0f 点（余量 %.0f%%）' % (cap, hr) if cap is not None else '余量 %.0f%%' % hr
             if info.get('resets'):
                 note += '（%s 满 %s）' % (info['binding'], info['resets'])
         claude_note = 'Claude: %s' % email if email and email != google else None
-        rows.append({'profile': p, 'headroom': hr, 'note': note, 'claude_account': claude_note, 'order': i})
-    rows.sort(key=lambda r: (r['headroom'] is None, -(r['headroom'] or 0.0), r['order']))
+        rows.append({'profile': p, 'headroom': hr, 'cap': cap, 'note': note, 'claude_account': claude_note, 'order': i})
+
+    def _pts(r):
+        return r['cap'] if r['cap'] is not None else r['headroom']
+    rows.sort(key=lambda r: (_pts(r) is None, -(_pts(r) or 0.0), r['order']))
     return (rows, _usage_age_text(fetched))
 
 def pick_profile_tk(profiles: list[dict], timeout_s: int=180) -> str | None:
@@ -632,7 +649,7 @@ def _cswap_managed_count() -> tuple[bool, int | None, str]:
         return (True, len(accounts), f'{len(accounts)} 个')
     except Exception as e:
         return (False, None, f'sequence.json 无法解析（{type(e).__name__}）')
-URL_ROUTING_CASES = [('https://claude.com/cai/oauth/authorize?client_id=x', True), ('https://platform.claude.com/oauth/authorize?client_id=x', True), ('https://claude.ai/oauth/authorize', True), ('https://claude.com./oauth/authorize', True), ('HTTPS://CLAUDE.COM/oauth/authorize/', True), ('https://claude.com/settings/usage', False), ('https://mcp.atlassian.com/v1/authorize', False), ('https://github.com/anthropics/claude-code', False), ('https://evil.example.com/oauth/authorize', False), ('https://evil.com\\@claude.com/oauth/authorize', False), ('https://account-0027@example.com/oauth/authorize', False), ('https://claude.com:8080/oauth/authorize', False), ('http://claude.com/oauth/authorize', False), ('https://claude.com.evil.com/oauth/authorize', False), ('https://xn--claude-9za.com/oauth/authorize', False), ('https://claude。com/oauth/authorize', False), ('https://claude.com/oauth/authorize.evil', False), ('https://claude.com/other/oauth/authorize', False), (' https://claude.com/oauth/authorize', False), ('https://claude.com/oauth/authorize ', False), ('https://claude.com/oauth/author\nize', False), ('https://claude.com\t.evil.com/oauth/authorize', False), ('https://claude.com:bad/oauth/authorize', False)]
+URL_ROUTING_CASES = [('https://claude.com/cai/oauth/authorize?client_id=x', True), ('https://platform.claude.com/oauth/authorize?client_id=x', True), ('https://claude.ai/oauth/authorize', True), ('https://claude.com./oauth/authorize', True), ('HTTPS://CLAUDE.COM/oauth/authorize/', True), ('https://claude.com/settings/usage', False), ('https://mcp.atlassian.com/v1/authorize', False), ('https://github.com/anthropics/claude-code', False), ('https://evil.example.com/oauth/authorize', False), ('https://evil.com\\@claude.com/oauth/authorize', False), ('https://account-0086@example.com/oauth/authorize', False), ('https://claude.com:8080/oauth/authorize', False), ('http://claude.com/oauth/authorize', False), ('https://claude.com.evil.com/oauth/authorize', False), ('https://xn--claude-9za.com/oauth/authorize', False), ('https://claude。com/oauth/authorize', False), ('https://claude.com/oauth/authorize.evil', False), ('https://claude.com/other/oauth/authorize', False), (' https://claude.com/oauth/authorize', False), ('https://claude.com/oauth/authorize ', False), ('https://claude.com/oauth/author\nize', False), ('https://claude.com\t.evil.com/oauth/authorize', False), ('https://claude.com:bad/oauth/authorize', False)]
 
 def _autopilot_available() -> tuple[bool, str]:
     here = Path(__file__).resolve().parent

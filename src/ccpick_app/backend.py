@@ -32,6 +32,11 @@ def command(args: list[str]) -> list[str]:
 
 
 def run(args: list[str], **kwargs) -> subprocess.CompletedProcess:
+    # Configured runtimes never mutate the legacy live store through a direct
+    # backend call. Compatibility commands must use the runtime adapter.
+    from . import runtime_profiles
+    if args[:1] in (["switch"], ["add"], ["remove"], ["enable"], ["disable"]) and runtime_profiles.enabled():
+        raise RuntimeError("runtime_backend_mutation_refused")
     kwargs["env"] = dict(os.environ if kwargs.get("env") is None else kwargs["env"],
                          PYTHONIOENCODING="utf-8")
     if kwargs.get("text") or kwargs.get("universal_newlines"):

@@ -16,6 +16,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 
 from . import runtime
 
@@ -109,7 +110,14 @@ foreach ($name in @({names})) {{
         for label in PRIVATE_LABELS:
             _run(["launchctl", "disable", f"{domain}/{label}"])
             _run(["launchctl", "bootout", f"{domain}/{label}"], check=False)
+    # The private Windows tray may need a few seconds to exit. Since 2026-09-24 its task runs it
+    # under `conhost --headless`; stopping the task only kills conhost, and the tray notices the
+    # missing parent on its next 5 s timer tick, then releases its mutex.
+    deadline = time.monotonic() + 15
     remaining = legacy_services()
+    while remaining and time.monotonic() < deadline:
+        time.sleep(1)
+        remaining = legacy_services()
     if remaining:
         raise RuntimeError("The private tray is still running. Quit it, then repeat setup --autoswitch --replace-legacy.")
 
@@ -265,17 +273,18 @@ def _windows_assets(legacy: Path, service_root: Path, state_root: Path) -> dict[
     start = source.index("function Resolve-Python {")
     end = source.index("$script:PYW = Resolve-Python", start)
     source = source[:start] + "function Resolve-Python { return " + _ps_quote(sys.executable) + " }\n" + source[end:]
-    source = _replace_once(source, '$cswap = Join-Path $env:USERPROFILE ".local\\bin\\cswap.exe"',
-                           "$cswap = " + _ps_quote(sys.executable))
-    source = _replace_once(source, "Start-Detached $cswap ('switch \"{0}\"' -f $email)",
-                           "Start-Detached $cswap ('-m ccpick_app switch \"{0}\"' -f $email)")
+    source = _replace_once(source, '$entry = Join-Path (Split-Path -Parent $Shared) "ccpick.py"',
+                           "$entry = " + _ps_quote(sys.executable))
+    source = _replace_once(source, 'Start-Detached $script:PYW (\'"{0}" switch "{1}"\' -f $entry, $email)',
+                           'Start-Detached $script:PYW (\'-m ccpick_app switch "{0}"\' -f $email)')
     # All children, including helper and manual backend actions, share the configured state root.
     source = _replace_once(source, '$ErrorActionPreference = "Continue"',
                            '$ErrorActionPreference = "Continue"\n$env:CCPICK_DATA_DIR = ' + _ps_quote(runtime.data_dir()))
-    tick = ("[CmdletBinding()]\nparam([switch]$DryRun)\n$ErrorActionPreference = 'Stop'\n"
+    tick = ("[CmdletBinding()]\nparam([switch]$DryRun, [switch]$Now, [switch]$ForceCheck)\n$ErrorActionPreference = 'Stop'\n"
             "$env:CCPICK_DATA_DIR = " + _ps_quote(runtime.data_dir()) + "\n"
             "$params = @('-m', 'ccpick_app.service', 'tick')\n"
             "if ($DryRun) { $params += '--dry-run' }\n"
+            "if ($ForceCheck) { $params += '--force-check' }\n"
             "& " + _ps_quote(sys.executable) + " @params\nexit $LASTEXITCODE\n")
     helper = ("from ccpick_app.service import main\n"
               "import sys\nraise SystemExit(main(['_helper', *sys.argv[1:]]))\n")
@@ -290,17 +299,25 @@ def _swift_literal(value: str) -> str:
 
 def _mac_assets(legacy: Path, service_root: Path, state_root: Path) -> dict[str, str]:
     source = (legacy / "autoswitch" / "menubar-main.swift").read_text(encoding="utf-8")
+    # Pin the manual switch to the installed package before replacing the
+    # separate helper interpreter below. Both entries must use the coordinator.
+    source = _replace_once(source,
+        'let entry = ("~/.claude/tools/ccpick/ccpick.py" as NSString).expandingTildeInPath',
+        'let entry = ' + _swift_literal(sys.executable))
+    source = _replace_once(source,
+        'p.launchPath = python\n        p.arguments = [entry, "switch", email]',
+        'p.launchPath = entry\n        p.arguments = ["-m", "ccpick_app", "switch", email]')
+    source = _replace_once(source, 'return "/usr/bin/python3"',
+                           'return ' + _swift_literal(sys.executable))
     replacements = {
         '"~/Library/Logs/claude-autoswitch-status.json"': _swift_literal(state_root / "status.json"),
         '"~/Library/Logs/claude-account-autoswitch.log"': _swift_literal(state_root / "autoswitch.log"),
         '"~/bin/claude-autoswitch-helper.py"': _swift_literal(service_root / "claude-autoswitch-helper.py"),
-        'p.launchPath = "/usr/bin/python3"': "p.launchPath = " + _swift_literal(sys.executable),
         'NSHomeDirectory() + "/Library/Logs/claude-autoswitch-menubar.debug.log"': _swift_literal(state_root / "menubar.debug.log"),
         '"~/Library/Logs/claude-autoswitch-menubar.placement"': _swift_literal(state_root / "menubar.placement"),
         'home + "/bin/claude-account-autoswitch.sh"': _swift_literal(service_root / "tick.sh"),
         'home + "/Library/Logs/claude-autoswitch-child.stderr.log"': _swift_literal(state_root / "child.stderr.log"),
-        'let cswap = ("~/.local/bin/cswap" as NSString).expandingTildeInPath': "let cswap = " + _swift_literal(sys.executable),
-        'p.arguments = ["switch", email]': 'p.arguments = ["-m", "ccpick_app", "switch", email]',
+        'home + "/Library/Logs/claude-autoswitch.watch-only"': _swift_literal(state_root / "claude-autoswitch.watch-only"),
         '$0.executableURL?.lastPathComponent == "claude-autoswitch-menubar"': '$0.executableURL?.lastPathComponent == "ccpick-public-menubar"',
     }
     for old, new in replacements.items():
@@ -311,7 +328,8 @@ def _mac_assets(legacy: Path, service_root: Path, state_root: Path) -> dict[str,
         raise RuntimeError("Packaged menu-bar autosave identifier changed")
     helper = "from ccpick_app.service import main\nimport sys\nraise SystemExit(main(['_helper', *sys.argv[1:]]))\n"
     tick = ("#!/bin/sh\nexport CCPICK_DATA_DIR=" + shlex.quote(str(runtime.data_dir())) + "\n"
-            "exec " + shlex.quote(sys.executable) + " -m ccpick_app.service tick\n")
+            "case \"${1:-}\" in --now) shift;; --force-check|'') ;; *) exit 2;; esac\n"
+            "exec " + shlex.quote(sys.executable) + " -m ccpick_app.service tick \"$@\"\n")
     return {"menubar-main.swift": source, "claude-autoswitch-helper.py": helper, "tick.sh": tick}
 
 
@@ -358,7 +376,7 @@ foreach ($name in @({task_names})) {{
 def _mac_plists(service_root: Path, state_root: Path) -> dict[str, dict]:
     environment = {"HOME": str(Path.home()), "CCPICK_DATA_DIR": str(runtime.data_dir()),
                    "LANG": "en_US.UTF-8", "PATH": os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")}
-    for key in ("CCSWITCH_THRESHOLD", "CCSWITCH_MODELS", "CCPICK_CHROME_USER_DATA_DIR"):
+    for key in ("CCSWITCH_THRESHOLD", "CCSWITCH_MODELS", "CCSWITCH_WATCH_ONLY", "CCPICK_CHROME_USER_DATA_DIR"):
         if key in os.environ:
             environment[key] = os.environ[key]
     common = {"EnvironmentVariables": environment, "RunAtLoad": True,

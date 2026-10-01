@@ -31,6 +31,7 @@ $STATUS  = Join-Path $Root "status.json"
 $LOG     = Join-Path $Root "autoswitch.log"
 $ACCTS   = Join-Path $Root "accounts.json"      # 账号列表缓存（面板用，全离线）
 $TRAYLOG = Join-Path $Root "tray.log"
+$WATCH_ONLY = Join-Path $Root "claude-autoswitch.watch-only"
 
 if (-not (Test-Path -LiteralPath $Root)) {
     New-Item -ItemType Directory -Path $Root -Force | Out-Null
@@ -40,6 +41,22 @@ function Write-TrayLog([string]$m) {
     $line = "{0}  {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $m
     Add-Content -LiteralPath $TRAYLOG -Value $line -Encoding utf8
     if ($Foreground) { Write-Host $line }
+}
+
+$script:ParentConhost = $null
+try {
+    $ppid = (Get-CimInstance Win32_Process -Filter "ProcessId=$PID").ParentProcessId
+    $pp = Get-Process -Id $ppid -ErrorAction Stop
+    if ($pp.ProcessName -eq "conhost") { $script:ParentConhost = @{ Id = $pp.Id; Start = $pp.StartTime } }
+} catch { }
+$script:Exiting = $false
+
+function Test-ParentGone {
+    if (-not $script:ParentConhost) { return $false }
+    try {
+        $p = Get-Process -Id $script:ParentConhost.Id -ErrorAction Stop
+        return ($p.StartTime -ne $script:ParentConhost.Start)
+    } catch { return $true }
 }
 
 if (-not $Foreground) {
@@ -82,7 +99,7 @@ function Read-Status {
         usedPct = $null; win5h = $null; win7d = $null; winModel = $null
         binding = $null; modelName = $null; modelCounted = $null
         cooling = $false; nextCheckS = $null; etaS = $null; burnRate = $null
-        activeEmail = ""; threshold = $null; age = [double]::PositiveInfinity
+        activeEmail = ""; threshold = $null; decisionAction = $null; age = [double]::PositiveInfinity
     }
     if (-not (Test-Path -LiteralPath $STATUS)) { return $d }
     try {
@@ -90,7 +107,7 @@ function Read-Status {
     } catch { return $d }
     foreach ($k in @("state","message","extra","usedPct","win5h","win7d","winModel",
                      "binding","modelName","modelCounted",
-                     "cooling","nextCheckS","etaS","burnRate","activeEmail","threshold")) {
+                     "cooling","nextCheckS","etaS","burnRate","activeEmail","threshold","decisionAction")) {
         if ($o.PSObject.Properties.Name -contains $k) { $d[$k] = $o.$k }
     }
     if ($o.PSObject.Properties.Name -contains "ts") {
@@ -109,6 +126,7 @@ function Get-IconSpec([string]$state) {
         "blocked"  { return @{ bg = [System.Drawing.Color]::FromArgb(255,204,0);  glyph = [char]0x0021 } }
         "error"    { return @{ bg = [System.Drawing.Color]::FromArgb(255,59,48);  glyph = [char]0x00D7 } }
         "offline"  { return @{ bg = [System.Drawing.Color]::FromArgb(255,149,0);  glyph = [char]0x2205 } }
+        "advise"   { return @{ bg = [System.Drawing.Color]::FromArgb(255,149,0);  glyph = [char]0x21C4 } }
         "cooling"  { return @{ bg = [System.Drawing.Color]::FromArgb(48,176,199); glyph = [char]0x231B } }
         "stalled"  { return @{ bg = [System.Drawing.Color]::FromArgb(175,82,222); glyph = [char]0x003F } }
         default    { return @{ bg = [System.Drawing.Color]::FromArgb(142,142,147);glyph = [char]0x003F } }
@@ -147,8 +165,14 @@ function New-StateIcon([string]$state) {
     return $icon
 }
 
-function Get-Headline([string]$state) {
+function Get-Headline([string]$state, [string]$message = "") {
+    if ($state -eq "blocked" -and $message.StartsWith("切换没成功")) { return "自动切号没切成" }
+    if ($state -eq "blocked" -and ($message.StartsWith("当前号疑似被封") -or $message.StartsWith("原号疑似被封"))) {
+        return "账号疑似被封"
+    }
+    if ($state -eq "ok" -and $message.StartsWith("只看不切")) { return "只看不切：在盯着（自动切号已关）" }
     switch ($state) {
+        "advise"   { return "该换号了（自动切号已关）" }
         "ok"       { return "自动切账号：在盯着" }
         "switched" { return "自动切账号：刚切过" }
         "blocked"  { return "全部账号额度用尽" }
@@ -228,13 +252,32 @@ function Read-Accounts {
     catch { return $null }
 }
 
-function Switch-To([string]$email) {
-    $cswap = Join-Path $env:USERPROFILE ".local\bin\cswap.exe"
-    if (-not (Test-Path -LiteralPath $cswap)) {
-        Write-TrayLog "WARN 找不到 cswap"; return
+function Get-SelectedEmail($accounts, $snapshot) {
+    $rows = @()
+    if ($null -ne $accounts -and $accounts.PSObject.Properties.Name -contains 'accounts') {
+        $rows = @($accounts.accounts)
     }
-    Write-TrayLog "手动切到 $email"
-    Start-Detached $cswap ('switch "{0}"' -f $email)
+    $marked = @($rows | Where-Object { $_.PSObject.Properties.Name -contains 'active' })
+    if ($marked.Count -gt 0) {
+        $chosen = @($marked | Where-Object { $_.active -is [bool] -and $_.active })
+        if ($chosen.Count -ne 1) { return '' }
+        $matches = @($rows | Where-Object { $_.email -eq $chosen[0].email })
+        if ($matches.Count -ne 1) { return '' }
+        return [string]$chosen[0].email
+    }
+    return ''
+}
+
+function Switch-To([string]$email) {
+    $entry = Join-Path (Split-Path -Parent $Shared) "ccpick.py"
+    if (-not $script:PYW -or -not (Test-Path -LiteralPath $entry)) {
+        Write-TrayLog "WARN 找不到受控切号入口"; return
+    }
+    if ($email -notmatch '^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$') {
+        Write-TrayLog "WARN 无效的本机账号标识"; return
+    }
+    Write-TrayLog "手动受控切号"
+    Start-Detached $script:PYW ('"{0}" switch "{1}"' -f $entry, $email)
     Start-Sleep -Milliseconds 1500
     Invoke-Check
 }
@@ -268,6 +311,55 @@ $script:Notify.Add_MouseUp({
     }
 })
 
+function Test-WatchOnlyOverride {
+    return ($env:CCSWITCH_WATCH_ONLY -match '^(?i:1|true|yes|on)$')
+}
+
+function Get-WatchOnlyMode {
+    return ((Test-Path -LiteralPath $WATCH_ONLY) -or (Test-WatchOnlyOverride))
+}
+
+function Set-WatchOnlyMode([bool]$enabled) {
+    if (-not $enabled -and (Test-WatchOnlyOverride)) {
+        throw "CCSWITCH_WATCH_ONLY 环境变量固定为只看不切"
+    }
+    if ($enabled) {
+        [System.IO.File]::WriteAllText($WATCH_ONLY, "watch-only`n", [System.Text.Encoding]::ASCII)
+    } elseif (Test-Path -LiteralPath $WATCH_ONLY) {
+        Remove-Item -LiteralPath $WATCH_ONLY -ErrorAction Stop
+    }
+    $script:LastCheckAt = [DateTime]::MinValue
+    $label = if ($enabled) { "只看不切" } else { "又看又切" }
+    Write-TrayLog ("模式改为：" + $label)
+    Show-TrayBalloon "Claude 切号模式" ("已选择「" + $label + "」，下一轮检查生效")
+}
+
+function Add-ModeItems {
+    $watchOnly = Get-WatchOnlyMode
+    foreach ($mode in @(
+        @{ label = "只看不切"; watch = $true; tip = "监控额度并提醒，账号由你手动选择" },
+        @{ label = "又看又切"; watch = $false; tip = "监控额度并自动选择账号，跟随选择的会话在安全节点切换" }
+    )) {
+        $mi = New-Object System.Windows.Forms.ToolStripMenuItem($mode.label)
+        $mi.Tag = $mode.watch
+        $mi.Checked = ($watchOnly -eq $mode.watch)
+        $mi.ToolTipText = $mode.tip
+        if (-not $mode.watch -and (Test-WatchOnlyOverride)) {
+            $mi.Enabled = $false
+            $mi.ToolTipText = "CCSWITCH_WATCH_ONLY 环境变量固定为只看不切"
+        }
+        $mi.Add_Click({
+            try { Set-WatchOnlyMode ([bool]$this.Tag) }
+            catch {
+                Write-TrayLog ("模式修改失败：" + $_.Exception.Message)
+                Show-TrayBalloon "模式未修改" "保存模式失败，请查看托盘日志"
+            }
+        })
+        [void]$script:Menu.Items.Add($mi)
+    }
+    [void]$script:Menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+}
+
 function Add-Info($text) {
     $mi = New-Object System.Windows.Forms.ToolStripMenuItem($text)
     $mi.Enabled = $false
@@ -278,7 +370,8 @@ function Build-Menu {
     $script:Menu.Items.Clear()
     $snap = Read-Status
 
-    Add-Info (Get-Headline $snap["state"])
+    Add-ModeItems
+    Add-Info (Get-Headline $snap["state"] ([string]$snap["message"]))
     if ($snap["message"]) { Add-Info ("   " + $snap["message"]) }
     if ($snap["extra"])   { Add-Info ("   " + $snap["extra"]) }
 
@@ -322,15 +415,25 @@ function Build-Menu {
         Add-Info "  正在读取账号余量…（下次打开就是现成的）"
     } else {
         Add-Info "账号（点账号名即切换）"
-        $activeEmail = $snap["activeEmail"]
+        $activeEmail = Get-SelectedEmail $acc $snap
         foreach ($a in $acc.accounts) {
+            $isSelected = $activeEmail -and $a.email -eq $activeEmail
+            $manualOnly = ($a.PSObject.Properties.Name -contains "autoSwitchEnabled") -and
+                ($a.autoSwitchEnabled -is [bool]) -and (-not $a.autoSwitchEnabled)
             $mark = "     "
-            if ($a.email -eq $activeEmail -or $a.active) { $mark = "  ●  " }
+            if ($isSelected) { $mark = "  ●  " }
             $label = $mark + $a.email
+            $tags = @()
+            if (($a.PSObject.Properties.Name -contains "plan") -and $a.plan -and ([string]$a.plan -ne "?")) { $tags += [string]$a.plan }
+            if (($a.PSObject.Properties.Name -contains "cap") -and ($null -ne $a.cap)) {
+                try { $tags += ("{0:F0} 点" -f [double]$a.cap) } catch { }
+            }
+            if ($manualOnly) { $tags += "仅手动" }
+            if ($tags.Count -gt 0) { $label = $label + "    " + ($tags -join " · ") }
 
             $blocked = $false
             if ($a.PSObject.Properties.Name -contains "blocked") { $blocked = [bool]$a.blocked }
-            if ($blocked) {
+            if ($blocked -and -not $manualOnly) {
                 $reason = ""
                 if ($a.PSObject.Properties.Name -contains "blockedWhy") { $reason = [string]$a.blockedWhy }
                 if ($reason.Length -gt 46) { $reason = $reason.Substring(0, 46) }
@@ -340,12 +443,19 @@ function Build-Menu {
 
             $mi = New-Object System.Windows.Forms.ToolStripMenuItem($label)
             $mi.Tag = $a.email
+            if ($manualOnly) {
+                $mi.ForeColor = [System.Drawing.Color]::DarkViolet
+                $mi.ToolTipText = "只在手动选择时使用，不参与自动切号。"
+                if ($blocked -and ($a.PSObject.Properties.Name -contains "blockedWhy")) {
+                    $mi.ToolTipText += " " + [string]$a.blockedWhy
+                }
+            }
             $mi.Add_Click({
                 $target = $this.Tag
                 try { Switch-To $target }
                 catch { Write-TrayLog ("切到 " + $target + " 出错: " + $_.Exception.Message) }
             })
-            if ($a.email -eq $activeEmail) { $mi.Enabled = $false }
+            if ($isSelected) { $mi.Enabled = $false }
             [void]$script:Menu.Items.Add($mi)
 
             if ($a.PSObject.Properties.Name -contains "windows") {
@@ -423,6 +533,13 @@ $script:LOGPATH = $LOG
 $iconTimer = New-Object System.Windows.Forms.Timer
 $iconTimer.Interval = 5000
 $iconTimer.Add_Tick({
+    if ($script:Exiting) { return }
+    if (Test-ParentGone) {
+        $script:Exiting = $true
+        Write-TrayLog ("父进程 conhost (pid={0}) 没了 —— 计划任务被结束，托盘跟着退出" -f $script:ParentConhost.Id)
+        [System.Windows.Forms.Application]::Exit()
+        return
+    }
     try { Update-Icon } catch { Write-TrayLog ("图标轮次出错: " + $_.Exception.Message) }
 })
 $script:LastKnownEmail = $null
@@ -445,7 +562,11 @@ function Notify-OnChange($snap) {
     if ($null -eq $script:LastKnownEmail) { $script:LastKnownEmail = $ae; return }
     if ($ae -ne $script:LastKnownEmail) {
         $script:LastKnownEmail = $ae
-        Show-TrayBalloon "Claude 账号已自动切换" "现在：$ae"
+        if ($snap['decisionAction'] -eq 'switched' -and $snap['state'] -eq 'switched') {
+            Show-TrayBalloon "Claude 账号已自动切换" "现在：$ae"
+        } else {
+            Show-TrayBalloon "Claude 账号已切换" "现在：$ae"
+        }
     }
 }
 
@@ -453,7 +574,10 @@ $script:SeenAlert = @{}
 function Notify-Alerts($snap) {
     $specs = @(
         @{ f = $script:NotifiedFile;                  title = "Claude 全部账号额度用尽" },
-        @{ f = ($script:NotifiedFile + ".switchfail"); title = "Claude 自动切号没切成" }
+        @{ f = ($script:NotifiedFile + ".switchfail"); title = "Claude 自动切号没切成" },
+        @{ f = ($script:NotifiedFile + ".denied");          title = "Claude 账号疑似被封" },
+        @{ f = ($script:NotifiedFile + ".denied-switched"); title = "Claude 账号疑似被封, 已自动换号" },
+        @{ f = ($script:NotifiedFile + ".watch"); title = "Claude 该换号了"; useMessage = $true }
     )
     foreach ($sp in $specs) {
         $ts = [long]0
@@ -464,7 +588,8 @@ function Notify-Alerts($snap) {
         if ($ts -gt $script:SeenAlert[$sp.f]) {
             $script:SeenAlert[$sp.f] = $ts
             $text = [string]$snap["extra"]
-            if (-not $text) { $text = [string]$snap["message"] }
+            if ($sp.ContainsKey("useMessage") -or -not $text) { $text = [string]$snap["message"] }
+            if ($sp.ContainsKey("useMessage")) { $text = "$text（自动切换已关）" }
             Show-TrayBalloon $sp.title $text
         } elseif ($ts -lt $script:SeenAlert[$sp.f]) {
             $script:SeenAlert[$sp.f] = $ts          # 文件被删 (恢复正常) ⇒ 下一次失败要能再弹
@@ -481,7 +606,7 @@ function Update-Icon {
     Notify-OnChange $snap
     Notify-Alerts $snap
 
-    $tip = "{0}`n{1}" -f (Get-Headline $snap["state"]), (Get-AgeText $snap["age"])
+    $tip = "{0}`n{1}" -f (Get-Headline $snap["state"] ([string]$snap["message"])), (Get-AgeText $snap["age"])
     if ($tip.Length -gt 63) { $tip = $tip.Substring(0, 63) }   # NotifyIcon.Text 硬上限 64
     $script:Notify.Text = $tip
 

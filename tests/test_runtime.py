@@ -108,7 +108,7 @@ class CoreTests(unittest.TestCase):
         private_source = (source / "ccpick.py").is_file()
         if not private_source:
             source = PUBLIC / "src/ccpick_app/legacy"
-        names = ["ccpick.py", "ccpick_auto.py", "ccpick_usage.py", "ccpick_enroll.py",
+        names = ["ccpick.py", "ccpick_auto.py", "ccpick_usage.py", "ccpick_enroll.py", "ccpick_coordination.py",
                  "ccpick_auto_authorize.py", "ccpick_cdp.py", "ccpick_js_gate.py",
                  "ccpick_cleanup.py", "auto_authorize.ps1",
                  "autoswitch/claude-autoswitch-decide.py", "autoswitch/claude-autoswitch-helper.py"]
@@ -132,7 +132,10 @@ class CoreTests(unittest.TestCase):
         self.stack.enter_context(patch("subprocess.run", side_effect=AssertionError("No real process allowed")))
         self.stack.enter_context(patch("subprocess.Popen", side_effect=AssertionError("No real process allowed")))
         self.usage = load("public_usage_for_tests", self.legacy / "ccpick_usage.py")
-        self.stack.enter_context(patch.dict(sys.modules, {"ccpick_usage": self.usage}))
+        coordination = load("public_coordination_for_tests", self.legacy / "ccpick_coordination.py")
+        self.stack.enter_context(patch.dict(sys.modules, {"ccpick_usage": self.usage,
+                                                       "ccpick_coordination": coordination}))
+        self.coordination = coordination
         self.usage.live_identity = lambda: "active@example.com"
         self.usage.CACHE.parent.mkdir(parents=True)
         self.usage.SEQ.write_text(json.dumps({"accounts": {
@@ -145,6 +148,18 @@ class CoreTests(unittest.TestCase):
             cache["accounts"][slot] = {"email": email, "fetchedAt": 1000,
                 "lastGood": {"five_hour": {"pct": pct, "resets_at": "2099-01-01T00:00:00Z"}}}
         self.usage.CACHE.write_text(json.dumps(cache), encoding="utf-8")
+
+    def test_strict_public_manual_switch_uses_shared_coordinator(self):
+        self.assertEqual(self.coordination.POLICY_FILE, runtime.data_dir() / "quota-policy.json")
+        with patch.object(self.coordination, "enabled", return_value=True), \
+                patch.object(self.coordination, "cmd_switch", return_value=0) as coordinated, \
+                patch.object(backend, "run", side_effect=AssertionError("must not bypass coordinator")):
+            self.assertEqual(cli.main(["switch", "ready@example.com"]), 0)
+            coordinated.assert_called_once_with(["ready@example.com"])
+        with patch.object(self.coordination, "enabled", side_effect=self.coordination.CoordinationError("invalid_device_policy")), \
+                patch.object(backend, "run", side_effect=AssertionError("must not downgrade policy")), \
+                redirect_stderr(io.StringIO()):
+            self.assertEqual(cli.main(["switch", "ready@example.com"]), 1)
 
     def test_auto_keeps_disabled_visible_but_never_selects_it(self):
         auto = load("public_auto_for_tests", self.legacy / "ccpick_auto.py")

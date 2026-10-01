@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import hashlib
 import sys
 import sysconfig
 
@@ -83,13 +84,71 @@ def account_enabled(slot: str, email: str = "", sequence: Path | None = None) ->
             encoding="utf-8"
         ))["accounts"]
         record = accounts[str(slot)]
-        if not isinstance(record, dict) or record.get("disabled"):
+        if (not isinstance(record, dict) or record.get("disabled") or
+                record.get("autoSwitchEnabled") is False):
             return False
         expected = str(record.get("email") or "").strip().casefold()
         actual = str(email or "").strip().casefold()
         return bool(expected and actual and expected == actual)
     except (OSError, ValueError, KeyError, TypeError):
         return False
+
+
+def automatic_target_enabled(query: object, sequence: Path | None = None) -> bool:
+    """Resolve the current roster again immediately before an automatic switch."""
+    try:
+        accounts = json.loads((sequence or backend_data_dir() / "sequence.json").read_text(
+            encoding="utf-8-sig"))["accounts"]
+        if not isinstance(accounts, dict):
+            return False
+        target = str(query).strip().casefold()
+        matches = [(str(slot), record) for slot, record in accounts.items()
+                   if isinstance(record, dict) and
+                   (target == str(slot).casefold() or
+                    target == str(record.get("email") or "").strip().casefold())]
+        if len(matches) != 1:
+            return False
+        slot, record = matches[0]
+        return account_enabled(slot, record.get("email"), sequence)
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def wait_context() -> str | None:
+    """Hash only local selection and policy so stale quota waits can be cancelled."""
+    try:
+        from .account_context import manager
+        managed = manager()
+        if managed is not None:
+            selection = managed.selection()
+            roster = [[p["name"], (p.get("account") or {}).get("uuid"),
+                       (p.get("account") or {}).get("email"),
+                       p.get("autoSwitchEnabled") is not False] for p in managed.profiles()]
+            identity = [selection.get("selected"), selection.get("selectedAt")]
+        else:
+            directory = os.environ.get("CLAUDE_CONFIG_DIR")
+            if directory and not Path(directory).is_absolute():
+                return None
+            source = Path(directory) / ".claude.json" if directory else Path.home() / ".claude.json"
+            account = json.loads(source.read_text(encoding="utf-8-sig")).get("oauthAccount") or {}
+            identity = [account.get("accountUuid"), account.get("emailAddress")]
+            accounts = json.loads((backend_data_dir() / "sequence.json").read_text(
+                encoding="utf-8-sig"))["accounts"]
+            if not any(identity) or not isinstance(accounts, dict):
+                return None
+            roster = [[str(slot), record.get("email"), bool(record.get("disabled")),
+                       record.get("autoSwitchEnabled") is not False]
+                      for slot, record in accounts.items() if isinstance(record, dict)]
+        policy_file = data_dir() / "quota-policy.json"
+        policy = [os.environ.get(key, "") for key in
+                  ("CCSWITCH_MODELS", "CCSWITCH_THRESHOLD", "CCSWITCH_WATCH_ONLY",
+                   "CCSWITCH_POLICY", "CCSWITCH_GATE_URL", "CCSWITCH_PROXY_URL")]
+        policy += [(data_dir() / "autoswitch" / "claude-autoswitch.watch-only").exists(),
+                   policy_file.read_text(encoding="utf-8-sig") if policy_file.exists() else None]
+        value = json.dumps([identity, sorted(roster), policy], sort_keys=True).encode("utf-8")
+        return hashlib.sha256(value).hexdigest()
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError):
+        return None
 
 
 def redact_auth_diagnostic(value: object, limit: int = 500) -> str:

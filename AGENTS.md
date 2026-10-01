@@ -10,6 +10,7 @@ Before proposing a change, run:
 python tools/check_public.py
 python tools/test_package.py
 python tools/test_core.py
+python tools/test_profiles.py
 ```
 
 Expected result: exit 0 for each command. Platform-specific regression skips are printed and are not counted as passing checks. CI also builds the distribution and checks desktop resources.
@@ -17,6 +18,8 @@ Expected result: exit 0 for each command. Platform-specific regression skips are
 `ccpick doctor` is read-only. `ccpick setup --dry-run` and `ccpick uninstall --dry-run` describe desktop changes. Do not run login, account switching, setup, or uninstall against a maintainer's real account merely to test a code change. Use a temporary home and mocked backend commands, as in `tests/`.
 
 `src/ccpick_app/backend.py` owns calls to the pinned credential backend. `runtime.py` owns platform paths. `setup.py` owns integration; `service.py` owns background execution. The decision engine is in `legacy/autoswitch/claude-autoswitch-decide.py`.
+
+`runtime_profiles.py` and `profile_runtime/` implement the optional account runtime. Runtime tests require Node.js 22+ and OpenSSL. Keep its setup explicit; never test it against a maintainer's live account store, proxy, native process, or browser. Use disposable homes, mocked credentials, and loopback fake upstreams. Verify both wheel and sdist with `tools/check_public.py --include-build` after building.
 
 Keep credentials, OAuth URLs/codes, browser profile data, account exports, local status, and user logs out of this repository. Diagnostic failures should identify a file or field without echoing sensitive values. Only documentation-domain email fixtures belong in tests.
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -35,6 +37,15 @@ class RuntimeProfilesTests(unittest.TestCase):
         profiles.write(self.root / "state.json", {"version": 2, "enabled": True,
                        "selected": "account-a", "selectedAt": "generation-a"})
         self.manager = profiles.Manager(self.root)
+
+    def directory_link(self, target: Path, link: Path):
+        self.assertTrue(target.resolve().is_relative_to(self.base))
+        self.assertTrue(link.parent.resolve().is_relative_to(self.base))
+        if os.name == "nt":
+            subprocess.run(["cmd.exe", "/c", "mklink", "/J", str(link), str(target)],
+                           check=True, capture_output=True)
+        else:
+            link.symlink_to(target, target_is_directory=True)
 
     def profile(self, name="account-a", *, bound=True, manual=False):
         root = self.root / "data" / name
@@ -72,6 +83,77 @@ class RuntimeProfilesTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"CCPICK_ACCOUNT_RUNTIME": "1", "CCPICK_RUNTIME_INSTALL": "relative.json"}):
             with self.assertRaisesRegex(profiles.ManagerError, "runtime_installation_invalid"):
                 profiles.installation()
+
+    def test_setup_canonicalizes_only_the_external_runtime_data_root(self):
+        from ccpick_app import backend
+        canonical, alias = self.base / "canonical-data", self.base / "data-alias"
+        canonical.mkdir()
+        self.directory_link(canonical, alias)
+        node, native = self.base / "node", self.base / "claude"
+        node.write_text("synthetic executable")
+        native.write_text("synthetic executable")
+        original = Path.is_file
+        def existing(path):
+            return True if str(path).replace('\\', '/').endswith('/openssl.exe') else original(path)
+        expected = canonical / "profile-runtime" / "private" / "account-profiles"
+        with mock.patch.object(profiles.runtime, "data_dir", return_value=alias), \
+                mock.patch.object(profiles.runtime, "launcher_path", return_value=str(self.base / "ccpick")), \
+                mock.patch.object(profiles.sys, "platform", "win32"), \
+                mock.patch.object(Path, "is_file", existing), \
+                mock.patch.object(Path, "home", return_value=self.base / "synthetic-home"), \
+                mock.patch.object(backend, "require_backend"), \
+                mock.patch.object(profiles, "_windows_permissions") as permissions, \
+                mock.patch.object(profiles.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "v24.1.0\n", "")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(profiles.setup(["--upstream-proxy", "http://127.0.0.1:18999", "--node", str(node),
+                                            "--native", str(native)]), 0)
+            self.assertEqual(profiles.installation(), expected / "install.json")
+            manager = profiles.Manager()
+            self.assertEqual(manager.root, expected)
+            self.assertEqual(Path(manager.install['serviceRoot']), canonical / "profile-runtime")
+            self.assertEqual(Path(manager.install['dataRoot']), expected / "data")
+            permissions.assert_called_once_with(canonical / "profile-runtime")
+            with mock.patch.dict(os.environ, {"CCPICK_ACCOUNT_RUNTIME": "1",
+                                 "CCPICK_RUNTIME_INSTALL": str(alias / "profile-runtime/private/account-profiles/install.json")}):
+                self.assertEqual(profiles.installation(), expected / "install.json")
+
+    def test_runtime_namespace_link_is_rejected_before_it_is_resolved(self):
+        redirected = self.base / "redirected-runtime"
+        self.service.rename(redirected)
+        self.directory_link(redirected, self.service)
+        with mock.patch.object(profiles.runtime, "data_dir", return_value=self.base):
+            with self.assertRaisesRegex(profiles.ManagerError, "^unsafe_path$"):
+                profiles.installation()
+        with mock.patch.dict(os.environ, {"CCPICK_ACCOUNT_RUNTIME": "1",
+                             "CCPICK_RUNTIME_INSTALL": str(self.root / "install.json")}):
+            with self.assertRaisesRegex(profiles.ManagerError, "^unsafe_path$"):
+                profiles.installation()
+
+    def test_private_directory_link_is_rejected_before_creation_or_permission_changes(self):
+        target, link = self.base / "external-private-tree", self.base / "private-link"
+        target.mkdir()
+        mode = target.stat().st_mode
+        self.directory_link(target, link)
+        with self.assertRaisesRegex(profiles.ManagerError, "^unsafe_path$"):
+            profiles._secure_directory(link / "new-child")
+        self.assertFalse((target / "new-child").exists())
+        self.assertEqual(target.stat().st_mode, mode)
+
+    def test_native_config_directory_link_remains_rejected(self):
+        root = self.profile("account-a")
+        external = self.base / "external-native-config"
+        (root / "claude").rename(external)
+        self.directory_link(external, root / "claude")
+        with self.assertRaisesRegex(profiles.ManagerError, "^unsafe_path$"):
+            self.manager.profiles()
+
+    def test_profile_directory_link_remains_rejected(self):
+        other = self.profile("account-b")
+        redirected = self.base / "external-account"
+        other.rename(redirected)
+        self.directory_link(redirected, other)
+        with self.assertRaisesRegex(profiles.ManagerError, "^unsafe_profile$"):
+            self.manager.profiles()
 
     def test_loopback_proxy_only(self):
         for value in ("http://127.0.0.1:8123", "http://[::1]:8123/"):

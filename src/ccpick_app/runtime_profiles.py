@@ -33,14 +33,42 @@ class ManagerError(RuntimeError):
     pass
 
 
+def _linked(path: Path) -> bool:
+    return path.is_symlink() or path.is_junction()
+
+
+def _private_tree(path: Path, boundary: Path) -> None:
+    """Reject redirects inside the owned tree before resolving or writing it."""
+    current = path
+    while True:
+        if _linked(current):
+            raise ManagerError("unsafe_path")
+        if current == boundary:
+            return
+        if current == current.parent:
+            raise ManagerError("unsafe_path")
+        current = current.parent
+
+
+def _install_path(candidate: Path) -> Path:
+    if not candidate.is_absolute() or len(candidate.parents) < 4 or ".." in candidate.parts:
+        raise ManagerError("runtime_installation_invalid")
+    service = candidate.parent.parent.parent
+    _private_tree(candidate, service)
+    # OS/user aliases are allowed outside our runtime namespace. Resolve that
+    # anchor only; account/config links inside it must never be normalized away.
+    anchor = service.parent
+    canonical = anchor.resolve() / candidate.relative_to(anchor)
+    _private_tree(canonical, canonical.parent.parent.parent)
+    return canonical
+
+
 def installation() -> Path:
     hint = os.environ.get("CCPICK_RUNTIME_INSTALL")
     if os.environ.get("CCPICK_ACCOUNT_RUNTIME") == "1" and hint:
         candidate = Path(hint)
-        if not candidate.is_absolute():
-            raise ManagerError("runtime_installation_invalid")
-        return candidate
-    return runtime.data_dir() / "profile-runtime" / "private" / "account-profiles" / "install.json"
+        return _install_path(candidate)
+    return _install_path(runtime.data_dir() / "profile-runtime" / "private" / "account-profiles" / "install.json")
 
 
 def resources() -> Path:
@@ -48,7 +76,7 @@ def resources() -> Path:
 
 
 def read(path: Path):
-    if path.is_symlink() or not path.is_file() or path.stat().st_size > 8 * 1024 * 1024:
+    if _linked(path) or not path.is_file() or path.stat().st_size > 8 * 1024 * 1024:
         raise ManagerError("unsafe_file")
     if os.name != "nt" and (path.stat().st_uid != os.getuid() or path.stat().st_mode & 0o077):
         raise ManagerError("private_permissions_required")
@@ -97,9 +125,12 @@ def manager():
 
 
 def _secure_directory(path: Path) -> None:
+    for current in (path, *path.parents):
+        if _linked(current):
+            raise ManagerError("unsafe_path")
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
     for current in (path, *path.parents):
-        if current.is_symlink():
+        if _linked(current):
             raise ManagerError("unsafe_path")
     if os.name != "nt":
         path.chmod(0o700)
@@ -244,6 +275,8 @@ class Manager:
         self.root = Path(root) if root else installation().parent
         if not self.root.is_absolute() or self.root.resolve() != self.root or not self.root.is_dir():
             raise ManagerError("unsafe_path")
+        _private_tree(self.root / "install.json", self.root.parent.parent)
+        _private_tree(self.root / "data", self.root)
         self.home = home or Path.home()
         self.install = read(self.root / "install.json")
         service = self.root.parent.parent
@@ -268,8 +301,9 @@ class Manager:
         for directory in sorted((self.root / "data").iterdir()):
             if not NAME.fullmatch(directory.name):
                 continue
-            if directory.is_symlink() or not directory.is_dir() or directory.resolve() != directory:
+            if _linked(directory) or not directory.is_dir() or directory.resolve() != directory:
                 raise ManagerError("unsafe_profile")
+            _private_tree(directory / "claude", self.root)
             if not (directory / "profile.json").exists():
                 continue
             profile = read(directory / "profile.json")

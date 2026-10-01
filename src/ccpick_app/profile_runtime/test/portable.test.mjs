@@ -11,7 +11,7 @@ import { serveRuntime } from '../runtime-service.mjs';
 import { runtimeServiceInfo, runtimeRpc } from '../runtime-client.mjs';
 
 async function fixture(t) {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ccpick-portable-test-'));
+  const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'ccpick-portable-test-')));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   const config = { dataRoot: path.join(root, 'data'), serviceRoot: root, platform: process.platform,
     native: '/synthetic/native', browser: '/synthetic/browser', seamlessAccounts: true,

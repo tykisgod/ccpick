@@ -8,6 +8,23 @@ import tempfile
 from pathlib import Path
 
 
+def isolated_environment(directory: Path) -> dict[str, str]:
+    # macOS /var aliases and Windows short temp names are valid OS spellings,
+    # but the runtime correctly rejects aliases inside controlled data paths.
+    # Canonicalize the fixture boundary before creating its home and temp roots.
+    home = directory.resolve(strict=True)
+    temporary = home / "tmp"
+    temporary.mkdir(mode=0o700)
+    environment = {key: value for key, value in os.environ.items()
+                   if not key.upper().startswith(("CLAUDE", "ANTHROPIC", "TYK_", "CCPICK", "CSWAP"))}
+    environment.update(HOME=str(home), USERPROFILE=str(home),
+                       LOCALAPPDATA=str(home / "local"), APPDATA=str(home / "roaming"),
+                       XDG_DATA_HOME=str(home / "data"), CCPICK_DATA_DIR=str(home / "ccpick"),
+                       CLAUDE_CONFIG_DIR=str(home / "claude"),
+                       TMPDIR=str(temporary), TMP=str(temporary), TEMP=str(temporary))
+    return environment
+
+
 def main() -> int:
     node = shutil.which("node")
     if not node:
@@ -25,13 +42,7 @@ def main() -> int:
         print("Portable runtime tests are missing from the package.")
         return 1
     with tempfile.TemporaryDirectory(prefix="ccpick-profiles-tests-") as temporary:
-        home = Path(temporary)
-        environment = {key: value for key, value in os.environ.items()
-                       if not key.upper().startswith(("CLAUDE", "ANTHROPIC", "TYK_", "CCPICK", "CSWAP"))}
-        environment.update(HOME=temporary, USERPROFILE=temporary,
-                           LOCALAPPDATA=str(home / "local"), APPDATA=str(home / "roaming"),
-                           XDG_DATA_HOME=str(home / "data"), CCPICK_DATA_DIR=str(home / "ccpick"),
-                           CLAUDE_CONFIG_DIR=str(home / "claude"))
+        environment = isolated_environment(Path(temporary))
         # Native probes and real Claude execution are deliberately outside this
         # suite. All transport tests use loopback servers or injected mocks.
         return subprocess.run([node, "--test", *map(str, tests)],

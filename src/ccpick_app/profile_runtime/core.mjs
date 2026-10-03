@@ -9,6 +9,7 @@ export const fail = reason => { throw new Error(reason); };
 export const object = value => value && typeof value === 'object' && !Array.isArray(value);
 export const privacyEnvironment = Object.freeze({ DISABLE_TELEMETRY: '1', DISABLE_ERROR_REPORTING: '1',
   DISABLE_AUTOUPDATER: '1', DISABLE_FEEDBACK_COMMAND: '1' });
+export const backgroundShellEnvironment = Object.freeze({ CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP: '1' });
 export const validName = name => /^[a-z][a-z0-9_-]{0,47}$/.test(name ?? '') &&
   !/^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(name);
 export function textValue(value, max = 120) {
@@ -56,6 +57,16 @@ export function profileDirectory(config, name) {
   if (!validName(name)) fail('invalid_name');
   return path.join(config.dataRoot, name);
 }
+export async function readEgressPolicy(config, name) {
+  const root = profileDirectory(config, name);
+  await regular(root, true);
+  let policy;
+  try { policy = await readJson(path.join(root, 'egress-policy.json')); }
+  catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+  if (!object(policy) || policy.version !== 1 || !['A', 'B', 'C', 'D'].includes(policy.household) ||
+      Object.keys(policy).some(key => !['version', 'household'].includes(key))) fail('account_egress_invalid');
+  return policy;
+}
 export async function getProfile(config, name) {
   const root = profileDirectory(config, name);
   await regular(root, true);
@@ -71,7 +82,9 @@ export async function getProfile(config, name) {
         Object.keys(policy).some(key => !['version', 'autoSwitchEnabled'].includes(key))) fail('profile_invalid');
     autoSwitchEnabled = policy.autoSwitchEnabled;
   } catch (error) { if (error.code !== 'ENOENT') throw error; }
-  return { ...manifest, autoSwitchEnabled, root,
+  const egress = await readEgressPolicy(config, name);
+  return { ...manifest, autoSwitchEnabled, household: egress?.household ?? null,
+    householdSource: egress ? 'explicit' : 'default', root,
     configDirectory: manifest.storage === 'native-default' ? path.join(os.homedir(), '.claude') : path.join(root, 'claude') };
 }
 export const globalConfigFile = p => p.storage === 'native-default'
@@ -88,10 +101,11 @@ export async function listProfiles(config, query = '') {
   }
   return results.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
 }
-export async function createProfile(config, { name, label, email, autoSwitchEnabled } = {}, { initialize = initializeNative } = {}) {
+export async function createProfile(config, { name, label, email, autoSwitchEnabled, household } = {}, { initialize = initializeNative } = {}) {
   if (name !== undefined && !validName(name)) fail('invalid_name');
   if (label !== undefined) textValue(label);
   if (autoSwitchEnabled !== undefined && typeof autoSwitchEnabled !== 'boolean') fail('invalid_arguments');
+  if (household !== undefined && !['A', 'B', 'C', 'D'].includes(household)) fail('invalid_household');
   if (email !== undefined && (textValue(email, 254) !== email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))) fail('invalid_email');
   if (email && (await listProfiles(config)).some(p => (p.account?.email ?? p.email ?? '').toLowerCase() === email.toLowerCase()))
     fail('account_already_registered');
@@ -121,6 +135,9 @@ export async function createProfile(config, { name, label, email, autoSwitchEnab
     ...(email ? { email } : {}), identity: Object.fromEntries(['userID', 'machineID'].map(k => [k, digest(ids[k])])), account: null };
   if (autoSwitchEnabled !== undefined) {
     await atomicJson(path.join(root, 'switch-policy.json'), { version: 1, autoSwitchEnabled });
+  }
+  if (household !== undefined) {
+    await atomicJson(path.join(root, 'egress-policy.json'), { version: 1, household });
   }
   await atomicJson(path.join(root, 'profile.json'), record);
   return getProfile(config, name);
@@ -157,6 +174,7 @@ export function childEnvironment(config, p, proxy, environment = process.env) {
   Object.assign(env, {
     CLAUDE_CONFIG_DIR: p.configDirectory, BROWSER: config.accountBrowser ?? config.browser,
     ...privacyEnvironment,
+    ...backgroundShellEnvironment,
   });
   if (p.storage === 'native-default') delete env.CLAUDE_CONFIG_DIR;
   env.CCPICK_ACCOUNT_PROFILE = p.name;

@@ -1,7 +1,7 @@
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
-import { regular, object, validName, digest, fail, privacyEnvironment } from './core.mjs';
+import { regular, object, validName, digest, fail, privacyEnvironment, backgroundShellEnvironment } from './core.mjs';
 
 async function snapshot(file) {
   try {
@@ -22,9 +22,19 @@ async function snapshot(file) {
 export function runtimeSettingsEnvironment(service, scope = 'default') {
   if (scope !== 'default' && !validName(scope)) fail('runtime_scope_invalid');
   if (!/^[a-f0-9]{64}$/.test(service?.key ?? '')) fail('runtime_key_invalid');
+  const port = service.scopeProxyPorts?.[scope] ?? service.proxyPort;
+  if (service.egressVersion === 1 && port !== undefined && (!Number.isInteger(port) || port < 1 || port > 65535))
+    fail('runtime_service_invalid');
+  const proxy = `http://127.0.0.1:${port}`;
   return {
+    ...backgroundShellEnvironment,
     ANTHROPIC_BASE_URL: 'https://api.anthropic.com',
     ANTHROPIC_CUSTOM_HEADERS: `Authorization: Bearer ${service.key}\nx-ccpick-account-runtime: ${service.key}\nx-ccpick-account-scope: ${scope}`,
+    ...(service.egressVersion === 1 && port !== undefined ? {
+      HTTPS_PROXY: proxy, HTTP_PROXY: proxy, ALL_PROXY: proxy,
+      WS_PROXY: proxy, WSS_PROXY: proxy,
+      NO_PROXY: '127.0.0.1,localhost,::1',
+    } : {}),
   };
 }
 

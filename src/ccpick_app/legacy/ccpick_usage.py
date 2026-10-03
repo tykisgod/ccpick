@@ -224,7 +224,7 @@ def managed_roster(path: Path | None=None) -> dict | None:
     unified = manager() if path is None else None
     if unified is not None:
         return {p.get('legacySlot', p['name']): (p.get('account') or {}).get('email', p.get('email', '')) for p in unified.profiles()}
-    'sequence.json 里真实托管的账号 {slot: email}。读不到返回 None（= 别过滤）。\n\n    ★为什么需要这个★ (2026-09-20 实测)\n    `cswap remove` 会把账号从 sequence.json 删掉，但【不清 usage.json 缓存】——\n    删掉 Account-3 之后缓存里那条还在，于是托盘继续列一个已经不存在的账号。\n    用户删了却没消失，比不删更让人困惑。\n\n    sequence.json 是权威，usage.json 只是缓存：缓存里多出来的一律不认。\n    但读不到 sequence.json 时返回 None 而不是空 —— 空会把所有账号都过滤掉，\n    面板整片空白；那种情况下宁可多显示也别全不显示（同 refresh() 的取舍）。\n    文件在、accounts 是 {} 时照实返回 {}：那是"全新安装、一个号都没托管"，\n    同 managed_account_count() 的口径 (example 7af68f583 把它也当读不到，这里不跟)。\n\n    ★连 email 一起给★ (2026-09-15 example 7af68f583，2026-09-24 移植)：\n    `cswap move/swap` 会重排 slot，只看 slot 在不在的话，缓存里旧 slot 那条会顶着\n    别人的位置混进来。path 给 decide.py 用 —— 它有自己的 SEQ，测试会换掉。\n    '
+    '返回当前托管名册 {slot: email}；读取失败返回 None。\n\n    sequence.json 是权威，usage.json 只是缓存。移除账号不会清除用量缓存，\n    因此缓存中的候选必须与名册核对。读取失败时不以空名册过滤全部账号；\n    文件存在且 accounts 为空字典时，照实返回空字典，与 managed_account_count 一致。\n\n    move/swap 会重排 slot，所以同时核对 email。path 参数供使用独立 SEQ 的调用方\n    和测试传入名册位置。\n    '
     try:
         accounts = json.loads((path or SEQ).read_text(encoding='utf-8')).get('accounts')
     except Exception:
@@ -268,7 +268,7 @@ def plan_info(seq_path: Path | None=None, configs_dir: Path | None=None) -> dict
     unified = manager() if seq_path is None and configs_dir is None else None
     if unified is not None:
         return {(p.get('account') or {}).get('email', '').lower(): p.get('plan', {}) for p in unified.profiles()}
-    '{email 小写: {"scale": 倍数, "plan": "20x"/"5x"/"Team"/"Pro"/"?", "org": 组织 uuid}}\n\n    认法, 先中先得:\n      1. ★同一个组织里有两个以上托管的号 ⇒ Team★ (sequence.json 的 organizationUuid,\n         cswap 入库时写的)。个人 Max / Pro 的组织只有自己一个人, 不会撞上。\n         ★排在快照前面是有原因的★: 本机 example@ 的快照里 oauthAccount 除了邮箱, 套餐\n         字段整段是 example@ 的 (accountCreatedAt 都一样) —— 照快照它是个人 20x,\n         可 sequence.json 里它跟另外四个 Team 号在同一个组织。\n      2. cswap 存的快照 configs/.claude-config-<slot>-<email>.json 里的 oauthAccount:\n         Team 席位 / *_max_20x / *_max_5x / Pro\n      3. 都认不出 ⇒ DEFAULT_SCALE, plan="?"\n    读不到任何东西时返回 {} —— 调用方一律退回 DEFAULT_SCALE。\n    按文件 mtime 记忆: decide 一轮要摊平好几次缓存, 快照每份 ~100KB, 不值得每次重读。\n    '
+    '{email 小写: {"scale": 倍数, "plan": "20x"/"5x"/"Team"/"Pro"/"?", "org": 组织 uuid}}\n\n    套餐来源按优先级判断：\n      1. sequence.json 的 organizationUuid 在多个托管账号中相同，判为 Team。\n         快照可能带有其他账号的套餐字段，因此组织关系优先于快照。\n      2. configs/.claude-config-<slot>-<email>.json 中的 oauthAccount 套餐字段。\n      3. 无法识别时使用 DEFAULT_SCALE，plan 为 "?"。\n    读取失败返回空字典，调用方使用 DEFAULT_SCALE。按文件 mtime 缓存，\n    避免同一轮决策多次读取较大的账号快照。\n    '
     seq_path = seq_path or SEQ
     configs_dir = configs_dir or CONFIGS
     try:

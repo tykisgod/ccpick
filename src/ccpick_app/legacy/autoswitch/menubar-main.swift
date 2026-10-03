@@ -244,6 +244,9 @@ struct Account {
     var blockedWhy: String = ""
     var unavailableWindows: [UnavailableWindowRow] = []
     var autoSwitchEnabled: Bool = true
+    var profileId: String? = nil
+    var household: String? = nil
+    var householdOptions: [String] = []
 }
 
 func menuAccounts(_ cached: [Account], home: String) -> [Account] {
@@ -267,6 +270,7 @@ func accountTitle(_ account: Account) -> String {
     if let plan = account.plan, !plan.isEmpty, plan != "?" { tags.append(plan) }
     if let cap = account.capacity, cap.isFinite { tags.append(String(format: "%.0f 点", cap)) }
     if !account.autoSwitchEnabled { tags.append("仅手动") }
+    if let household = account.household, ["A", "B", "C", "D"].contains(household) { tags.append("家宽 " + household) }
     return (account.active ? "● " : "   ") + account.email
         + (tags.isEmpty ? "" : "    " + tags.joined(separator: " · "))
 }
@@ -320,7 +324,10 @@ func loadAccounts() -> (accounts: [Account], fetchedAt: Double?) {
                        blocked: (r["blocked"] as? Bool) ?? false,
                        blockedWhy: (r["blockedWhy"] as? String) ?? "",
                        unavailableWindows: unavailableWindowRows(r["unavailableWindows"] as? [[String: Any]] ?? []),
-                       autoSwitchEnabled: accountAutoSwitchEnabled(r["autoSwitchEnabled"]))
+                       autoSwitchEnabled: accountAutoSwitchEnabled(r["autoSwitchEnabled"]),
+                       profileId: r["profile"] as? String,
+                       household: ["A", "B", "C", "D"].contains(r["household"] as? String ?? "") ? r["household"] as? String : nil,
+                       householdOptions: (r["householdOptions"] as? [String] ?? []).filter { ["A", "B", "C", "D"].contains($0) })
     }
     return (list, obj["fetchedAt"] as? Double)
 }

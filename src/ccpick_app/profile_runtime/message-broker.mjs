@@ -47,11 +47,12 @@ function headersFor(headers, privateHeaders = false) {
 }
 
 function frozenSnapshot(value) {
-  const { accessToken, deviceId, accountUuid, organizationUuid, profileId, generation } = value ?? {};
+  const { accessToken, deviceId, accountUuid, organizationUuid, profileId, generation, egress } = value ?? {};
   if (typeof accessToken !== 'string' || !accessToken || accessToken.length > 16_384 || /[\s\x00-\x1f\x7f]/.test(accessToken) ||
       typeof deviceId !== 'string' || !/^[a-f0-9]{64}$/i.test(deviceId) || typeof accountUuid !== 'string' || !UUID.test(accountUuid) ||
       (organizationUuid != null && (typeof organizationUuid !== 'string' || !UUID.test(organizationUuid)))) throw new Error('invalid_account_snapshot');
-  return Object.freeze({ accessToken, deviceId, accountUuid, organizationUuid, profileId, generation });
+  return Object.freeze({ accessToken, deviceId, accountUuid, organizationUuid, profileId, generation,
+    ...(egress ? { egress: Object.freeze({ household: egress.household, proxy: egress.proxy, revision: egress.revision }) } : {}) });
 }
 
 function objectSpans(text, start = 0, limit = text.length) {
@@ -201,7 +202,14 @@ export function createMessageBroker(options = {}) {
   if (typeof options.localKey !== 'string' || options.localKey.length < 32 || options.localKey.length > 512 || /[^\x21-\x7e]/.test(options.localKey))
     throw new Error('local_runtime_key_required');
   const expectedKey = digest(options.localKey);
-  const transport = options.transport ?? createHouseTransport(options.upstreamProxy);
+  const transports = new Map();
+  if (!options.transport) transports.set(options.upstreamProxy, createHouseTransport(options.upstreamProxy));
+  const transport = options.transport ?? (input => {
+    const proxy = input.snapshot.egress?.proxy ?? options.upstreamProxy;
+    let send = transports.get(proxy);
+    if (!send) { send = createHouseTransport(proxy); transports.set(proxy, send); }
+    return send(input);
+  });
   if (typeof transport !== 'function') throw new Error('invalid_upstream_transport');
   const maxBodyBytes = boundedInteger(options.maxBodyBytes, 32 * 1024 * 1024, 128 * 1024 * 1024);
   const maxBufferedBytes = boundedInteger(options.maxBufferedBytes, Math.max(maxBodyBytes, 64 * 1024 * 1024), 512 * 1024 * 1024);
@@ -279,7 +287,7 @@ export function createMessageBroker(options = {}) {
       if (Object.hasOwn(req.headers, 'x-organization-uuid') && snapshot.organizationUuid) headers['x-organization-uuid'] = snapshot.organizationUuid;
       else delete headers['x-organization-uuid'];
       counts.dispatched++;
-      const pendingResponse = Promise.resolve(transport({ path: req.url, headers, body, signal }));
+      const pendingResponse = Promise.resolve(transport({ path: req.url, headers, body, signal, snapshot }));
       void pendingResponse.then(incoming => { if (signal.aborted) incoming?.destroy(); }, () => {});
       response = await abortable(pendingResponse, signal);
       body = null;

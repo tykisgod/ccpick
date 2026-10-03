@@ -42,7 +42,8 @@ function bundle(account, selection) {
   return Object.freeze({ profileId: account.name, accessToken: token,
     deviceId: ids.userID, machineId: ids.machineID, accountUuid: account.accountUuid,
     organizationUuid: oauth.organizationUuid, generation: selection.selectedAt,
-    expiresAt: account.credentials.claudeAiOauth.expiresAt });
+    expiresAt: account.credentials.claudeAiOauth.expiresAt,
+    ...(account.egress ? { egress: account.egress } : {}) });
 }
 
 export class ActiveRuntime {
@@ -82,6 +83,7 @@ export class ActiveRuntime {
     this.#mirroredToken = fingerprint(next.accessToken);
     this.#snapshot = next;
     this.#selection = selection;
+    await this.#adapter.published?.(next);
     await this.#saveControl();
     return true;
   }
@@ -128,10 +130,10 @@ export class ActiveRuntime {
       const unknown = tokenHash && !this.#knownTokens.has(tokenHash);
       const bound = tokenHash && this.#boundGrants.get(tokenHash);
       if (token && bound && (changed || refreshPresent)) {
-        const remote = await this.#adapter.verifyGrant(staged.credentials);
+        const remote = await this.#adapter.verifyGrant(staged.credentials, { household: bound.intent.household });
         if (!remote?.accountUuid) fail('auth_unverified');
         const imported = await this.#adapter.importGrant({ credentials: staged.credentials,
-          remote, intentId: bound.intent.id });
+          remote, intentId: bound.intent.id, household: bound.intent.household });
         this.#knownTokens.add(tokenHash);
         const current = await this.#adapter.readSelection();
         if (available(current) && this.#intent?.id === bound.intent.id &&
@@ -158,7 +160,7 @@ export class ActiveRuntime {
       }
       if (!this.#snapshot || !sameSelection(selection, this.#selection)) {
         if (!(await this.#publish(selection))) continue;
-      } else if ((this.#adapter.needsRefresh ? this.#adapter.needsRefresh(this.#snapshot) :
+      } else if (await this.#adapter.routeChanged?.(this.#snapshot) || (this.#adapter.needsRefresh ? this.#adapter.needsRefresh(this.#snapshot) :
           !Number.isFinite(this.#snapshot.expiresAt) || this.#snapshot.expiresAt <= this.#now() + 60_000)) {
         if (!(await this.#publish(selection))) continue;
       }
@@ -167,13 +169,13 @@ export class ActiveRuntime {
     fail('selection_changed');
   }
 
-  beginLogin({ sessionId, oauthState, oauthChallenge } = {}) {
+  beginLogin({ sessionId, oauthState, oauthChallenge, household } = {}) {
     return this.#serial(async () => {
       await this.#loadControl();
       if (this.#intent?.expiresAt > this.#now() && !this.#intent.superseded) {
         if (!sessionId || this.#intent.sessionId !== sessionId) fail('login_in_progress');
         if (!oauthState || oauthState === this.#intent.oauthState)
-          return { id: this.#intent.id, expiresAt: this.#intent.expiresAt };
+          return { id: this.#intent.id, expiresAt: this.#intent.expiresAt, household: this.#intent.household };
         this.#intent = undefined;
         await this.#saveControl();
       }
@@ -182,11 +184,14 @@ export class ActiveRuntime {
         if (!['login_required', 'auth_forbidden', 'auth_unverified', 'auth_rate_limited',
           'network_unavailable', 'auth_renewal_failed'].includes(error.message)) throw error;
       }
+      const selection = { ...await this.#adapter.readSelection() };
+      const resolvedHousehold = await this.#adapter.loginHousehold?.(selection.selected, household);
       const intent = { id: randomUUID(), sessionId, oauthState, oauthChallenge,
-        selection: { ...await this.#adapter.readSelection() }, expiresAt: this.#now() + 10 * 60_000 };
+        ...(resolvedHousehold ? { household: resolvedHousehold } : {}),
+        selection, expiresAt: this.#now() + 10 * 60_000 };
       this.#intent = intent;
       await this.#saveControl();
-      return { id: intent.id, expiresAt: intent.expiresAt };
+      return { id: intent.id, expiresAt: intent.expiresAt, household: intent.household };
     });
   }
 
@@ -204,7 +209,8 @@ export class ActiveRuntime {
   validateLoginExchange(request) {
     return this.#serial(async () => {
       await this.#loadControl();
-      return { intentId: this.#exchangeIntent(request).id };
+      const intent = this.#exchangeIntent(request);
+      return { intentId: intent.id, ...(intent.household !== undefined ? { household: intent.household } : {}) };
     });
   }
 

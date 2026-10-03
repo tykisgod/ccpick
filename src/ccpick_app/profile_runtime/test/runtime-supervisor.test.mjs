@@ -7,7 +7,7 @@ import { EventEmitter, once } from 'node:events';
 import { spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { atomicJson, readJson } from '../core.mjs';
-import { superviseRuntime, runtimeProcessAlive, supervisorEnvironment } from '../runtime-supervisor.mjs';
+import { superviseRuntime, runtimeProcessAlive, runtimeProcessIdentity, runtimeOwnerAlive, supervisorEnvironment } from '../runtime-supervisor.mjs';
 
 async function fixture(t) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'runtime-supervisor-test-'));
@@ -70,6 +70,7 @@ test('concurrent second host cannot start and a live legacy service is only obse
   await atomicJson(path.join(root, 'service.lock'), { pid: process.pid, instanceId: 'existing-legacy' });
   let checked = false, spawned = false;
   await superviseRuntime(install, { loadConfig: async () => config, handleSignals: false,
+    isAlive: pid => pid === process.pid,
     spawnChild: () => { spawned = true; throw new Error('must not spawn'); },
     sleep: async () => {
       if (checked) return;
@@ -104,6 +105,81 @@ test('daemon environment strips inherited routing, credentials and Node preloads
     HTTP_PROXY: 'wrong', https_proxy: 'wrong', ALL_PROXY: 'wrong', NO_PROXY: '*', WS_PROXY: 'wrong', WSS_PROXY: 'wrong' }),
   { PATH: 'safe', HOME: 'safe-home' });
   assert.equal(runtimeProcessAlive(process.pid), true); assert.equal(runtimeProcessAlive(-1), null);
+});
+
+test('owner generation and executable reject reused live PIDs without exposing command lines', async () => {
+  const identity = { pid: 731, createdAt: '2026-10-03T00:00:00.1234567Z', executable: process.execPath,
+    script: fileURLToPath(new URL('../runtime-supervisor.mjs', import.meta.url)) };
+  const owner = { pid: identity.pid, nonce: 'fixture-owner', processIdentity: identity };
+  const check = actual => runtimeOwnerAlive(owner, { isAlive: () => true, inspectProcess: async () => actual });
+  assert.equal(await check({ ...identity }), true);
+  assert.equal(await check({ ...identity, createdAt: '2026-10-03T00:01:00.1234567Z' }), false);
+  assert.equal(await check({ ...identity, executable: path.join(path.dirname(process.execPath), 'unrelated-node.exe') }), false);
+  assert.equal(await check({ ...identity, script: path.join(path.dirname(identity.script), 'other-script.mjs') }), false);
+  assert.equal(await check({ ...identity, script: null }), true);
+  assert.equal(await check(null), null);
+  assert.equal(await check(false), false);
+  assert.equal(await check({ ...identity, executable: '' }), null);
+  assert.equal(await runtimeOwnerAlive(owner, { isAlive: () => null, inspectProcess: async () => identity }), null);
+  assert.equal(await runtimeOwnerAlive(owner, { isAlive: () => false, inspectProcess: async () => { throw Error('must not inspect'); } }), false);
+});
+
+test('legacy live locks require positive role evidence; missing identity never proves staleness', async () => {
+  const script = fileURLToPath(new URL('../runtime-supervisor.mjs', import.meta.url));
+  const actual = { pid: 732, createdAt: 'fixture-birth', executable: process.execPath, script };
+  const options = { isAlive: () => true, executable: process.execPath, script, inspectProcess: async () => actual };
+  assert.equal(await runtimeOwnerAlive({ pid: actual.pid }, options), true);
+  assert.equal(await runtimeOwnerAlive({ pid: actual.pid }, { ...options, inspectProcess: async () => ({ ...actual, script: null }) }), null);
+  assert.equal(await runtimeOwnerAlive({ pid: actual.pid }, { ...options,
+    inspectProcess: async () => ({ ...actual, executable: path.join(path.dirname(process.execPath), 'previous-node.exe') }) }), null);
+  assert.equal(await runtimeOwnerAlive({ pid: actual.pid }, { ...options,
+    inspectProcess: async () => ({ ...actual, executable: path.join(path.dirname(process.execPath), 'cua-node.exe'),
+      script: path.join(path.dirname(script), 'unrelated-app.mjs') }) }), false);
+  assert.equal(await runtimeOwnerAlive({ pid: actual.pid, processIdentity: { ...actual, executable: 'relative-path' } }, options), null);
+  assert.equal(await runtimeOwnerAlive({ pid: -1 }, options), null);
+});
+
+test('Node upgrade preserves a live legacy supervisor when its executable differs from current configuration', async t => {
+  const { config, root, install } = await fixture(t), lock = path.join(root, 'supervisor.lock');
+  const original = { pid: 735, nonce: 'legacy-node-before-upgrade' }; await atomicJson(lock, original);
+  const script = fileURLToPath(new URL('../runtime-supervisor.mjs', import.meta.url));
+  const actual = { pid: original.pid, createdAt: 'legacy-process-birth',
+    executable: path.join(path.dirname(process.execPath), 'previous-node.exe'), script };
+  await assert.rejects(superviseRuntime(install, { loadConfig: async () => config, handleSignals: false,
+    isAlive: () => true, inspectProcess: async () => actual }), /runtime_supervisor_busy/);
+  assert.deepEqual(await readJson(lock), original);
+});
+
+test('reused supervisor PID is reclaimed only with verified process evidence and new owner records its birth', async t => {
+  const { config, root, install } = await fixture(t), lock = path.join(root, 'supervisor.lock');
+  const script = fileURLToPath(new URL('../runtime-supervisor.mjs', import.meta.url));
+  const own = { pid: process.pid, createdAt: 'fixture-own-birth', executable: process.execPath, script };
+  const original = { pid: 733, nonce: 'original-owner', processIdentity: { ...own, pid: 733, createdAt: 'old-birth' } };
+  await atomicJson(lock, original);
+  let inspections = 0;
+  config.seamlessAccounts = false;
+  const result = await superviseRuntime(install, { loadConfig: async () => config, handleSignals: false,
+    isAlive: () => true, getProcessIdentity: async () => own,
+    inspectProcess: async () => { inspections++; return { ...original.processIdentity, createdAt: 'reused-birth' }; } });
+  assert.equal(inspections, 1); assert.equal(result.attempts, 0);
+  assert.equal(await readJson(lock, true), null);
+  assert.deepEqual((await readJson(path.join(root, 'supervisor.json'))).processIdentity, own);
+  assert.doesNotMatch(await fs.readFile(path.join(root, 'supervisor.json'), 'utf8'), /commandLine/i);
+});
+
+test('unknown external process identity preserves the original supervisor lock', async t => {
+  const { config, root, install } = await fixture(t), lock = path.join(root, 'supervisor.lock');
+  const original = { pid: 734, nonce: 'unknown-owner' }; await atomicJson(lock, original);
+  await assert.rejects(superviseRuntime(install, { loadConfig: async () => config, handleSignals: false,
+    isAlive: () => true, inspectProcess: async () => null }), /runtime_supervisor_busy/);
+  assert.deepEqual(await readJson(lock), original);
+});
+
+test('current process inspection records birth and executable but no complete argv', async () => {
+  const identity = await runtimeProcessIdentity(process.pid);
+  assert.equal(identity.pid, process.pid); assert.ok(identity.createdAt);
+  assert.ok(path.isAbsolute(identity.executable)); assert.equal(identity.commandLine, undefined);
+  assert.equal(await runtimeOwnerAlive({ pid: process.pid, processIdentity: identity }), true);
 });
 
 test('real detached host recovers a crashed child after its launching wrapper exits', { timeout: 15000 }, async t => {

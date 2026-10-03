@@ -10,10 +10,28 @@ import path from 'node:path';
 import { once } from 'node:events';
 import { PassThrough, Writable } from 'node:stream';
 import { setTimeout as delay } from 'node:timers/promises';
-import { houseJson } from '../house-request.mjs';
+import { houseJson, authRetryAt } from '../house-request.mjs';
 import { runtimeCertificate } from '../runtime-certificate.mjs';
 
 const token = 'INVENTED-HOUSE-ACCESS-NOT-REAL';
+test('429 deadlines preserve the 30 minute minimum and longer seconds or HTTP dates', () => {
+  const now = Date.parse('2026-10-02T00:00:00Z');
+  for (const value of [undefined, '', 'bad', '-1', '5', 'Infinity', '1e1000'])
+    assert.equal(authRetryAt(value, now), now + 1_800_000);
+  assert.equal(authRetryAt('7200', now), now + 7_200_000);
+  assert.equal(authRetryAt('Fri, 02 Oct 2026 03:00:00 GMT', now), now + 10_800_000);
+});
+
+test('house 429 exposes only its stable reason/status and the longer absolute retry deadline', async t => {
+  const now = Date.now(), f = await fake(t, { responseStatus: 429, headers: { 'retry-after': '7200' },
+    payload: 'INVENTED PRIVATE RESPONSE' });
+  await assert.rejects(houseJson(f.proxy, 'profile', { token }), error => {
+    assert.equal(error.message, 'auth_rate_limited'); assert.equal(error.status, 429);
+    assert(error.retryAt >= now + 7_200_000 && error.retryAt <= Date.now() + 7_200_000);
+    assert(!JSON.stringify(error).includes('PRIVATE')); return true;
+  });
+  assert.equal(f.calls.length, 1);
+});
 async function until(predicate) {
   const deadline = Date.now() + 2000;
   while (!predicate()) { assert(Date.now() < deadline, 'fixture condition timed out'); await delay(5); }

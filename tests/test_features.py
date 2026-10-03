@@ -304,6 +304,13 @@ class FeatureTests(unittest.TestCase):
         self.assertIn("systemPurple", mac)
         self.assertIn("$chosen.Count -ne 1", windows)
         self.assertIn("active.count == 1", mac)
+        self.assertNotIn("HouseholdAction", windows)
+        self.assertNotIn("Add-HouseholdItems", windows)
+        self.assertNotIn("householdOperation", mac)
+        self.assertNotIn("changeHousehold", mac)
+        self.assertNotIn("addAccountFromMenu", mac)
+        self.assertIn("Start-SwitchConfirmation $pending.email", windows)
+        self.assertIn("Get-SelectedEmail $accounts $null", windows)
 
     def test_managed_nonnumeric_slots_pass_through_desktop_helper(self):
         managed = SyntheticManager()
@@ -325,6 +332,25 @@ class FeatureTests(unittest.TestCase):
         self.assertIn('r["slot"] as? String', mac)
         self.assertIn('function Switch-To([string]$email)', windows)
         self.assertIn('$mi.Tag = $a.email', windows)
+
+    def test_live_desktop_helper_does_not_replace_current_identity_with_cached_status(self):
+        helper = load("public_helper_fresh_selection", self.legacy / "autoswitch/claude-autoswitch-helper.py")
+        usage = SimpleNamespace(live_identity=lambda: "beta@example.com",
+            capacity=lambda *_args: None, plan_info=lambda: {},
+            counts_toward_limit=lambda key: key in ("5h", "7d"),
+            counted_windows=lambda _wins: {}, is_usable=lambda _row: (True, "usable"),
+            is_blocked=lambda _row: (False, ""))
+        usage.collect = lambda: [{"slot": str(index), "email": email,
+            "active": email == usage.live_identity(), "windows": {}}
+            for index, email in enumerate(("alpha@example.com", "beta@example.com"), 1)]
+        output = io.StringIO()
+        with patch.object(helper, "_load_usage", return_value=(usage, "")), \
+                patch.object(helper, "_active_email_from_status", return_value="alpha@example.com") as stale, \
+                redirect_stdout(output):
+            self.assertEqual(helper.cmd_accounts(["--live"]), 0)
+        stale.assert_not_called()
+        rows = json.loads(output.getvalue())["accounts"]
+        self.assertEqual([row["email"] for row in rows if row["active"]], ["beta@example.com"])
 
     def test_context_bare_import_rewrites_with_original_local_name(self):
         import ast

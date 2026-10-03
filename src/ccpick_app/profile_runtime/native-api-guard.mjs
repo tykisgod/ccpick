@@ -6,6 +6,11 @@ import { createHash, timingSafeEqual, X509Certificate } from 'node:crypto';
 const API = 'api.anthropic.com';
 const OAUTH = 'platform.claude.com';
 const LOCAL_HEADER = 'x-ccpick-account-runtime';
+const SCOPE_HEADER = 'x-ccpick-account-scope';
+const ACCOUNT_SUFFIXES = ['anthropic.com', 'claude.ai', 'claude.com', 'claude.app',
+  'claudeusercontent.com', 'claudemcpcontent.com'];
+export const isAccountTunnelHost = hostname => typeof hostname === 'string' &&
+  ACCOUNT_SUFFIXES.some(suffix => hostname === suffix || hostname.endsWith(`.${suffix}`));
 const MODEL_PATHS = new Set(['/v1/messages', '/v1/messages/count_tokens']);
 const HOP = new Set(['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
   'te', 'trailer', 'transfer-encoding', 'upgrade']);
@@ -55,7 +60,7 @@ function uniqueHeaders(req) {
   const seen = new Set();
   for (let i = 0; i < req.rawHeaders.length; i += 2) {
     const name = req.rawHeaders[i].toLowerCase();
-    if (['host', 'authorization', 'content-length', 'transfer-encoding', LOCAL_HEADER].includes(name) && seen.has(name)) return false;
+    if (['host', 'authorization', 'content-length', 'transfer-encoding', LOCAL_HEADER, SCOPE_HEADER].includes(name) && seen.has(name)) return false;
     seen.add(name);
   }
   return true;
@@ -134,7 +139,11 @@ async function smallBody(req, timeoutMs) {
  * state/challenge validation and grant persistence BEFORE replying to native.
  * It must reject refresh grants: refresh is owned by the account vault. Without
  * this handler platform.claude.com is blocked, never transparently tunneled.
- * apiHandler({method,path,headers,body,signal},res), when supplied, replaces only
+ * resolveProxy({kind,hostname,headers?,signal}) may bind each non-model API
+ * request or opaque CONNECT to one local proxy and optional scalar revision.
+ * API headers contain the actual bearer; tunnel resolution receives no native
+ * credential. Resolution failure never falls back to the startup proxy.
+ * apiHandler({method,path,headers,body,signal,proxy,revision?},res) replaces only
  * the non-model transport (an offline-test seam). Default transport verifies
  * public upstream TLS via upstreamProxy; it never uses the supplied local CA.
  */
@@ -142,7 +151,10 @@ export function createNativeApiGuard(options = {}) {
   const proxy = selectorUrl(options.upstreamProxy);
   if (typeof options.messagesHandler !== 'function' ||
       (options.apiHandler !== undefined && typeof options.apiHandler !== 'function') ||
-      (options.oauthHandler !== undefined && typeof options.oauthHandler !== 'function')) throw fail('invalid_guard_handler');
+      (options.oauthHandler !== undefined && typeof options.oauthHandler !== 'function') ||
+      (options.resolveProxy !== undefined && typeof options.resolveProxy !== 'function')) throw fail('invalid_guard_handler');
+  const scope = options.scope;
+  if (scope !== undefined && scope !== 'default' && !/^[a-z][a-z0-9_-]{0,47}$/.test(scope)) throw fail('invalid_guard_scope');
   const localKey = options.localKey;
   if (localKey !== undefined && (typeof localKey !== 'string' || !localKey || localKey.length > 4096 || /[\s\x00-\x1f\x7f]/.test(localKey)))
     throw fail('invalid_guard_local_key');
@@ -155,27 +167,54 @@ export function createNativeApiGuard(options = {}) {
         (options.oauthHandler && !cert.checkHost(OAUTH, { subject: 'never' }))) throw new Error();
     context = tls.createSecureContext({ cert: options.tls.cert, key: options.tls.key, minVersion: 'TLSv1.2' });
   } catch { throw fail('invalid_guard_tls_identity'); }
-  const sockets = new Set(), outbound = new Set();
+  const sockets = new Set(), outbound = new Set(), tunnels = new Set();
   const counts = { intercepted: 0, tunneled: 0, model: 0, api: 0, oauth: 0, rejected: 0, failed: 0 };
   let closing = false, closePromise;
   function track(socket) {
     sockets.add(socket); socket.once('close', () => sockets.delete(socket)); socket.on('error', () => {}); return socket;
   }
-  function connect(target) {
+  function scopeMatches(req, { optional = false } = {}) {
+    const supplied = req.headers[SCOPE_HEADER];
+    return scope === undefined || supplied === scope || (supplied === undefined && (scope === 'default' || optional));
+  }
+  async function resolveProxy(input) {
+    if (input.signal.aborted) throw fail('guard_route_unavailable');
+    if (!options.resolveProxy) return Object.freeze({ proxy: proxy.href });
+    let timer, stop;
+    try {
+      const value = await new Promise((resolve, reject) => {
+        stop = () => reject(fail('guard_route_unavailable'));
+        input.signal.addEventListener('abort', stop, { once: true });
+        timer = setTimeout(stop, timeoutMs); timer.unref();
+        Promise.resolve().then(() => options.resolveProxy(Object.freeze(input))).then(resolve, reject);
+      });
+      if (input.signal.aborted || !value || typeof value !== 'object') throw fail('guard_route_unavailable');
+      const selectedProxy = selectorUrl(value.proxy).href;
+      const revision = value.revision;
+      if (revision !== undefined && !((typeof revision === 'string' && revision.length > 0 && revision.length <= 256 &&
+          !/[\x00-\x1f\x7f]/.test(revision)) || (Number.isSafeInteger(revision) && revision >= 0)))
+        throw fail('guard_route_unavailable');
+      return Object.freeze({ proxy: selectedProxy, ...(revision !== undefined ? { revision } : {}) });
+    } catch { throw fail('guard_route_unavailable'); }
+    finally { clearTimeout(timer); input.signal.removeEventListener('abort', stop); }
+  }
+  function connect(target, selectedRoute, signal) {
     return new Promise((resolve, reject) => {
-      if (closing) { reject(fail('guard_closed')); return; }
+      if (closing || signal?.aborted) { reject(fail('selector_connect_failed')); return; }
+      const selectedProxy = selectorUrl(selectedRoute.proxy);
       let settled = false;
-      const request = http.request({ hostname: proxy.hostname.replace(/^\[|\]$/g, ''), port: proxy.port,
+      const request = http.request({ hostname: selectedProxy.hostname.replace(/^\[|\]$/g, ''), port: selectedProxy.port,
         method: 'CONNECT', path: target, headers: { host: target }, agent: false });
       outbound.add(request);
-      const done = () => { clearTimeout(timer); outbound.delete(request); };
+      const done = () => { clearTimeout(timer); outbound.delete(request); signal?.removeEventListener('abort', error); };
       const error = () => { if (settled) return; settled = true; done(); request.destroy(); reject(fail('selector_connect_failed')); };
       const timer = setTimeout(error, timeoutMs); timer.unref();
+      signal?.addEventListener('abort', error, { once: true });
       request.once('error', error);
       request.once('close', () => { if (!settled) error(); });
       request.once('connect', (response, socket, head) => {
         track(socket);
-        if (settled || closing) { socket.destroy(); error(); return; }
+        if (settled || closing || signal?.aborted) { socket.destroy(); error(); return; }
         if (response.statusCode !== 200 || head.length) { socket.destroy(); error(); return; }
         settled = true; done(); resolve(socket);
       });
@@ -188,7 +227,7 @@ export function createNativeApiGuard(options = {}) {
     const stop = () => { clearTimeout(timer); request?.destroy(); response?.destroy(); agent?.destroy(); secure?.destroy(); socket?.destroy(); };
     input.signal.addEventListener('abort', stop, { once: true });
     try {
-      socket = await connect(`${API}:443`);
+      socket = await connect(`${API}:443`, input, input.signal);
       if (input.signal.aborted) throw fail('api_request_incomplete');
       secure = track(tls.connect({ socket, servername: API, ca: tls.rootCertificates,
         rejectUnauthorized: true, ALPNProtocols: ['http/1.1'] }));
@@ -220,9 +259,11 @@ export function createNativeApiGuard(options = {}) {
     const reject = (status, reason) => { counts.rejected++; reply(res, status, reason); };
     if (closing) return reject(503, 'guard_closed');
     if (!validOrigin(req, API)) return reject(403, 'api_origin_rejected');
+    if (!scopeMatches(req, { optional: true })) return reject(403, 'api_scope_rejected');
     let selected;
     try { selected = route(req); } catch (error) { return reject(403, error.reason ?? 'api_route_unsupported'); }
     if (selected.model) {
+      if (!scopeMatches(req)) return reject(403, 'api_scope_rejected');
       const matches = value => typeof value === 'string' && timingSafeEqual(digest(value), digest(localKey));
       const header = req.headers[LOCAL_HEADER];
       const bearer = typeof req.headers.authorization === 'string' && req.headers.authorization.startsWith('Bearer ')
@@ -250,8 +291,12 @@ export function createNativeApiGuard(options = {}) {
       if (body.length && (!selected.nullable || body.toString('utf8').trim() !== 'null')) return reject(403, 'api_body_unsupported');
       if (req.method === 'POST') headers['content-length'] = String(body.length);
       if (controller.signal.aborted) return;
+      const selectedRoute = await resolveProxy({ kind: 'api', hostname: API,
+        headers: Object.freeze({ ...headers }), signal: controller.signal });
+      if (controller.signal.aborted) return;
       counts.api++;
-      await (options.apiHandler ?? forwardApi)({ method: req.method, path: req.url, headers, body, signal: controller.signal }, res);
+      await (options.apiHandler ?? forwardApi)({ method: req.method, path: req.url, headers, body,
+        signal: controller.signal, ...selectedRoute }, res);
     } catch (error) {
       counts.failed++;
       reply(res, 502, ['api_body_unsupported', 'api_request_incomplete'].includes(error.reason) ? error.reason : 'api_upstream_unavailable');
@@ -263,6 +308,7 @@ export function createNativeApiGuard(options = {}) {
     const reject = reason => { counts.rejected++; reply(res, 403, reason); };
     if (closing) return reject('guard_closed');
     if (!validOrigin(req, OAUTH)) return reject('oauth_origin_rejected');
+    if (!scopeMatches(req, { optional: true })) return reject('oauth_scope_rejected');
     if (req.method !== 'POST' || req.url !== '/v1/oauth/token') return reject('oauth_route_unsupported');
     if (req.headers.authorization !== undefined || Object.keys(req.headers).some(name => IDENTITY_HEADERS.test(name)))
       return reject('oauth_authorization_unsupported');
@@ -308,12 +354,19 @@ export function createNativeApiGuard(options = {}) {
       if (head.length) socket.unshift(head);
       sites.get(target.hostname).emit('connection', socket); return;
     }
+    const controller = new AbortController();
+    const record = { socket, controller, upstream: undefined,
+      protected: isAccountTunnelHost(target.hostname) };
+    tunnels.add(record);
+    const stop = () => { tunnels.delete(record); controller.abort(); record.upstream?.destroy(); };
+    socket.once('close', stop);
     void (async () => {
-      let upstream;
-      const stop = () => upstream?.destroy(); socket.once('close', stop);
       try {
-        upstream = await connect(target.target);
-        if (socket.destroyed || closing) { upstream.destroy(); return; }
+        const selectedRoute = await resolveProxy({ kind: 'tunnel', hostname: target.hostname, signal: controller.signal });
+        if (socket.destroyed || closing || controller.signal.aborted) return;
+        const upstream = await connect(target.target, selectedRoute, controller.signal);
+        record.upstream = upstream;
+        if (socket.destroyed || closing || controller.signal.aborted) { upstream.destroy(); return; }
         counts.tunneled++; socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
         upstream.once('close', () => socket.destroy()); upstream.once('error', () => socket.destroy());
         if (head.length) upstream.write(head);
@@ -333,6 +386,13 @@ export function createNativeApiGuard(options = {}) {
     },
     address: () => server.address(),
     status: () => ({ ...counts, sockets: sockets.size, closing }),
+    invalidateTunnels() {
+      let invalidated = 0;
+      for (const record of tunnels) if (record.protected) {
+        invalidated++; tunnels.delete(record); record.controller.abort(); record.upstream?.destroy(); record.socket.destroy();
+      }
+      return invalidated;
+    },
     close() {
       if (closePromise) return closePromise;
       closing = true; for (const req of outbound) req.destroy(); for (const socket of sockets) socket.destroy();

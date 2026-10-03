@@ -8,6 +8,13 @@ const endpoints = new Map([
   ['login', ['platform.claude.com', '/v1/oauth/token', 'POST']],
 ]);
 
+export function authRetryAt(retryAfter, now = Date.now()) {
+  const value = typeof retryAfter === 'string' ? retryAfter.trim() : '';
+  const seconds = value ? Number(value) : NaN;
+  const parsed = Number.isFinite(seconds) ? now + seconds * 1000 : Date.parse(value);
+  return Math.max(now + 1_800_000, Number.isFinite(parsed) ? parsed : 0);
+}
+
 export function houseJson(proxy, kind, { token, body, timeoutMs = 30_000, ca } = {}) {
   const endpoint = endpoints.get(kind);
   if (!endpoint) throw new Error('unsupported_account_endpoint');
@@ -62,6 +69,7 @@ export function houseJson(proxy, kind, { token, body, timeoutMs = 30_000, ca } =
               const error = new Error(code === 401 || code === 400 ? 'login_required' :
                 code === 403 ? 'auth_forbidden' : code === 429 ? 'auth_rate_limited' : 'auth_unverified');
               error.status = code;
+              if (code === 429) error.retryAt = authRetryAt(response.headers['retry-after']);
               return stop(error);
             }
             try { stop(null, JSON.parse(Buffer.concat(chunks).toString('utf8'))); }

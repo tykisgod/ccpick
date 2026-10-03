@@ -163,6 +163,7 @@ class SetupTests(unittest.TestCase):
         self.assertNotIn('Join-Path $env:USERPROFILE ".local\\bin\\cswap.exe"', tray)
         self.assertNotIn('Join-Path (Split-Path -Parent $Shared) "ccpick.py"', tray)
         self.assertIn("CCPICK_DATA_DIR", tray)
+        self.assertIn("args.append('--live')", assets["claude-autoswitch-helper.py"])
 
     def test_mac_assets_and_plists_have_no_private_executable_or_state_paths(self):
         root, state = self.data / "services", self.data / "autoswitch"
@@ -173,6 +174,7 @@ class SetupTests(unittest.TestCase):
         self.assertNotIn('~/.claude/tools/ccpick/ccpick.py', swift)
         self.assertIn('p.launchPath = entry', swift)
         self.assertIn('"-m", "ccpick_app", "switch", email', swift)
+        self.assertIn("args.append('--live')", assets["claude-autoswitch-helper.py"])
         for label, plist in setup._mac_plists(root, state).items():
             self.assertTrue(label.startswith("io.github.tykisgod.ccpick."))
             self.assertEqual(plist["EnvironmentVariables"]["CCPICK_DATA_DIR"], str(self.data))
@@ -193,6 +195,77 @@ class SetupTests(unittest.TestCase):
             result = setup._powershell("$tokens=$null; $errors=$null; [void][System.Management.Automation.Language.Parser]::ParseFile(" +
                                        setup._ps_quote(path) + ", [ref]$tokens, [ref]$errors); if ($errors.Count) { $errors | ForEach-Object { $_.Message }; exit 1 }")
             self.assertEqual(result.returncode, 0)
+
+    @unittest.skipUnless(platform.system() == "Windows", "PowerShell action regression runs on Windows")
+    def test_windows_switch_confirms_fresh_helper_result_and_times_out_safely(self):
+        source = setup._windows_assets(LEGACY, self.data / "services", self.data / "autoswitch")["claude-autoswitch-tray.ps1"]
+        asset = self.root / "tray-fixture.ps1"
+        asset.write_text(source, encoding="utf-8-sig")
+        harness = self.root / "switch-fixture.ps1"
+        harness.write_text("$asset = " + setup._ps_quote(asset) + "\n" + r'''
+$ErrorActionPreference = 'Stop'
+$tokens = $null; $errors = $null
+$tree = [System.Management.Automation.Language.Parser]::ParseFile($asset, [ref]$tokens, [ref]$errors)
+foreach ($name in @('Get-SelectedEmail', 'Complete-SwitchAction')) {
+    $definition = @($tree.FindAll({ param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+    }, $true))
+    if ($definition.Count -ne 1) { throw 'fixture function missing' }
+    Invoke-Expression $definition[0].Extent.Text
+}
+$script:Messages = New-Object System.Collections.Generic.List[string]
+$script:ConfirmationReads = 0; $script:Stops = 0
+function Write-TrayLog { }
+function Show-TrayBalloon([string]$title, [string]$message) { $script:Messages.Add($title) }
+function Get-SwitchFailureMessage { return 'fixture failure' }
+function Update-Accounts { }
+function Stop-AccountsRefreshWorker { $script:Stops += 1 }
+function Read-Accounts { throw 'stale menu data must not confirm a switch' }
+function New-FixtureAction([string]$payload, [int]$exitCode, [bool]$confirmation) {
+    $process = [pscustomobject]@{ HasExited = $true; ExitCode = $exitCode; Disposed = $false }
+    $process | Add-Member ScriptMethod Dispose { $this.Disposed = $true }
+    return @{ process = $process; output = @{ IsCompleted = $true; Result = $payload };
+        error = @{ IsCompleted = $true; Result = '' }; email = 'beta@example.com';
+        confirmation = $confirmation; startedAt = [DateTime]::UtcNow }
+}
+function Start-SwitchConfirmation([string]$email) {
+    $script:ConfirmationReads += 1
+    return New-FixtureAction '{"accounts":[{"email":"beta@example.com","active":true}]}' 0 $true
+}
+$original = New-FixtureAction 'switch command finished' 0 $false
+$script:SwitchAction = $original
+Complete-SwitchAction
+if (-not $script:SwitchAction.confirmation -or $script:ConfirmationReads -ne 1 -or
+    $script:Messages.Count -ne 0 -or -not $original.process.Disposed) { throw 'confirmation was not deferred' }
+Complete-SwitchAction
+if ($script:SwitchAction -or $script:LastKnownEmail -ne 'beta@example.com' -or
+    $script:Messages[-1] -ne 'Claude 账号已切换') { throw 'fresh account confirmation failed' }
+$script:SwitchAction = New-FixtureAction '{"accounts":[{"email":"beta@example.com","active":true}]}' 0 $true
+$script:SwitchAction.startedAt = [DateTime]::UtcNow.AddSeconds(-21)
+Complete-SwitchAction
+if ($script:SwitchAction -or $script:Stops -ne 0 -or
+    $script:Messages[-1] -ne 'Claude 账号已切换') { throw 'completed read was incorrectly timed out' }
+foreach ($payload in @('{"accounts":[{"email":"alpha@example.com","active":true}]}',
+    '{"accounts":[{"email":"beta@example.com","active":true},{"email":"alpha@example.com","active":true}]}',
+    'invalid fixture JSON')) {
+    $script:SwitchAction = New-FixtureAction $payload 0 $true
+    Complete-SwitchAction
+    if ($script:SwitchAction -or $script:Messages[-1] -eq 'Claude 账号已切换') { throw 'invalid confirmation accepted' }
+}
+$script:SwitchAction = New-FixtureAction '' 1 $false
+Complete-SwitchAction
+if ($script:SwitchAction -or $script:ConfirmationReads -ne 1 -or
+    $script:Messages[-1] -ne '切号未完成') { throw 'failed switch accepted' }
+$expired = New-FixtureAction '' 0 $true
+$expired.startedAt = [DateTime]::UtcNow.AddSeconds(-21)
+$expired.process.HasExited = $false
+$script:SwitchAction = $expired
+Complete-SwitchAction
+if ($script:SwitchAction -or $script:Stops -ne 1 -or -not $expired.process.Disposed -or
+    $script:Messages[-1] -ne '切号确认未完成') { throw 'confirmation timeout did not release action' }
+''', encoding="utf-8-sig")
+        result = setup._powershell("& " + setup._ps_quote(harness))
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     @unittest.skipUnless(platform.system() == "Darwin" and shutil.which("swiftc"), "Swift/AppKit check runs on macOS")
     def test_generated_menubar_swift_typechecks(self):

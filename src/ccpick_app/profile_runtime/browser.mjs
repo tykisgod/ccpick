@@ -4,6 +4,7 @@ import { getProfile, verifyIdentity, globalConfigFile, readJson, atomicJson, wit
 import { registryState } from './registry.mjs';
 import { prepareNetwork } from './network.mjs';
 import { inheritedRuntimeScope, runtimeRequest } from './runtime-client.mjs';
+import { AccountEgressRouter } from './account-egress.mjs';
 
 export function loginUrl(value, email, { allowNoHint = false } = {}) {
   if (typeof value !== 'string' || value.length > 32768 || /[\x00-\x20\x7f"\\]/.test(value)) fail('invalid_login_url');
@@ -42,13 +43,21 @@ export async function openAccountBrowser(config, value, { environment = process.
   if (scope !== null) {
     if (!/^[a-f0-9-]{36}$/.test(environment.CCPICK_RUNTIME_CLIENT_ID ?? '')) fail('managed_session_required');
     const target = loginUrl(value, undefined, { allowNoHint: true });
-    await network(config, { checkOnly: true });
+    let browserConfig = config;
     if (target.oauth) {
       const url = new URL(target.url);
-      await request(config, 'login-begin', { scope, sessionId: environment.CCPICK_RUNTIME_CLIENT_ID,
+      const intent = await request(config, 'login-begin', { scope, sessionId: environment.CCPICK_RUNTIME_CLIENT_ID,
         oauthState: url.searchParams.get('state'), oauthChallenge: url.searchParams.get('code_challenge') });
+      if (intent?.household) browserConfig = (await new AccountEgressRouter(config, { network }).group(intent.household)).networkConfig;
+    } else {
+      const route = await request(config, 'browser-route', { scope });
+      if (route?.scope !== scope || !['A', 'B', 'C', 'D'].includes(route.household)) fail('account_egress_invalid');
+      browserConfig = (await new AccountEgressRouter(config, { network }).group(route.household)).networkConfig;
     }
-    const result = await open(config.browser, [target.url], { env: environment, capture: true, timeoutMs: 120000 });
+    await network(browserConfig, { checkOnly: true });
+    const browserEnvironment = { ...environment, CCPICK_FIXED_EGRESS_HOME: browserConfig.serviceRoot,
+      CCPICK_FIXED_EGRESS_PROFILE: browserConfig.networkProfile };
+    const result = await open(browserConfig.browser, [target.url], { env: browserEnvironment, capture: true, timeoutMs: 120000 });
     if (result.code !== 0) fail('house_browser_not_ready');
     return 0;
   }

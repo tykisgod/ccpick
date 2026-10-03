@@ -34,6 +34,8 @@ async function setup(t, options = {}) {
   const selectorPort = await listen(selector);
   const guard = createNativeApiGuard({ tls: fixture, upstreamProxy: `http://127.0.0.1:${selectorPort}`, localKey: KEY,
     connectTimeoutMs: 1000,
+    resolveProxy: options.resolveProxy,
+    scope: options.scope,
     oauthHandler: options.oauthHandler,
     messagesHandler: options.messagesHandler ?? (async (req, res) => {
       let body = ''; for await (const bytes of req) body += bytes;
@@ -51,7 +53,7 @@ async function setup(t, options = {}) {
     for (const socket of sockets) socket.destroy();
     await new Promise(resolve => selector.close(resolve));
   });
-  return { guard, selector, connects, apiCalls, modelCalls };
+  return { guard, selector, selectorPort, connects, apiCalls, modelCalls };
 }
 
 function tunnel(port, target = 'api.anthropic.com:443', headers = {}) {
@@ -296,4 +298,163 @@ test('platform token grants require an explicit coordinator; other routes and lo
     assert.equal(result.status, 403); assert.match(result.body, new RegExp(reason));
   }
   assert.equal(grants.length, 1); assert.equal(connects.length, 0);
+});
+
+test('API routing uses the actual bearer and freezes the route before dispatch', async t => {
+  const started = Promise.withResolvers(), release = Promise.withResolvers();
+  const routeA = { proxy: 'http://127.0.0.1:12808', revision: 'route-a-1' };
+  const routeB = { proxy: 'http://127.0.0.1:13808', revision: 'route-b-1' };
+  const calls = [], resolutions = [];
+  const { guard } = await setup(t, { resolveProxy: input => {
+    resolutions.push(input);
+    assert.equal(input.kind, 'api'); assert.equal(input.hostname, 'api.anthropic.com');
+    assert.ok(Object.isFrozen(input)); assert.ok(Object.isFrozen(input.headers));
+    assert.equal(input.headers['x-ccpick-account-runtime'], undefined);
+    return input.headers.authorization === TOKEN_A ? routeA : routeB;
+  }, apiHandler: async (input, res) => {
+    calls.push(input);
+    if (input.headers.authorization === TOKEN_A) { started.resolve(); await release.promise; }
+    res.end('{}');
+  } });
+  const first = request(guard, '/api/oauth/profile', { headers: { authorization: TOKEN_A } });
+  await started.promise;
+  routeA.proxy = routeB.proxy; routeA.revision = 'mutated-after-admission';
+  assert.equal(guard.invalidateTunnels(), 0);
+  assert.equal((await request(guard, '/api/oauth/usage', { headers: { authorization: TOKEN_B } })).status, 200);
+  release.resolve(); assert.equal((await first).status, 200);
+  assert.deepEqual(calls.map(input => [input.headers.authorization, input.proxy, input.revision]), [
+    [TOKEN_A, 'http://127.0.0.1:12808/', 'route-a-1'], [TOKEN_B, 'http://127.0.0.1:13808/', 'route-b-1'],
+  ]);
+  assert.equal(resolutions.length, 2);
+});
+
+test('route resolution errors and nonlocal proxies fail closed without fallback or secret disclosure', async t => {
+  for (const resolveProxy of [() => { throw new Error(TOKEN_A + KEY + 'http://secret.invalid'); },
+    () => ({ proxy: 'http://secret.invalid:1234' }),
+    () => ({ proxy: 'http://127.0.0.1:1234', revision: { private: TOKEN_A } })]) {
+    const { guard, apiCalls, connects } = await setup(t, { resolveProxy });
+    const api = await request(guard, '/api/oauth/profile', { headers: { authorization: TOKEN_A } });
+    assert.equal(api.status, 502); assert.match(api.body, /api_upstream_unavailable/);
+    const connect = await tunnel(guard.address().port, 'statsig.anthropic.com:443');
+    assert.equal(connect.status, 502); assert.match(connect.body, /selector_connect_failed/);
+    for (const value of [api.body, connect.body]) {
+      assert.ok(!value.includes('INVENTED')); assert.ok(!value.includes(KEY)); assert.ok(!value.includes('secret.invalid'));
+    }
+    assert.equal(apiCalls.length, 0); assert.equal(connects.length, 0);
+  }
+});
+
+test('scope guard binds model headers while bearer-only native APIs keep their actual account route', async t => {
+  const { guard, modelCalls, apiCalls } = await setup(t, { scope: 'account-a', resolveProxy: input => {
+    assert.equal(input.kind, 'api'); assert.equal(input.headers.authorization, TOKEN_A);
+    return { proxy: 'http://127.0.0.1:12808', revision: 'actual-account-a' };
+  } });
+  for (const supplied of [undefined, 'default', 'account-b']) {
+    const headers = { authorization: TOKEN_A, ...(supplied ? { 'x-ccpick-account-scope': supplied } : {}) };
+    if (supplied) {
+      const api = await request(guard, '/api/oauth/profile', { headers });
+      assert.equal(api.status, 403); assert.match(api.body, /api_scope_rejected/);
+    }
+    const model = await request(guard, '/v1/messages', { method: 'POST', body: '{}',
+      headers: { ...headers, 'x-ccpick-account-runtime': KEY } });
+    assert.equal(model.status, 403); assert.match(model.body, /api_scope_rejected/);
+  }
+  assert.equal(modelCalls.length, 0); assert.equal(apiCalls.length, 0);
+  assert.equal((await request(guard, '/api/oauth/usage', { headers: { authorization: TOKEN_A } })).status, 200);
+  assert.equal(apiCalls[0].proxy, 'http://127.0.0.1:12808/'); assert.equal(apiCalls[0].revision, 'actual-account-a');
+  assert.equal((await request(guard, '/api/oauth/profile', { headers: {
+    authorization: TOKEN_A, 'x-ccpick-account-scope': 'account-a' } })).status, 200);
+  const compatible = await setup(t, { scope: 'default' });
+  assert.equal((await request(compatible.guard, '/api/oauth/profile', { headers: { authorization: TOKEN_A } })).status, 200);
+  assert.equal((await request(compatible.guard, '/api/oauth/profile', { headers: {
+    authorization: TOKEN_A, 'x-ccpick-account-scope': 'account-a' } })).status, 403);
+});
+
+test('OAuth uses PKCE scope ownership without requiring model custom headers', async t => {
+  let grants = 0;
+  const { guard } = await setup(t, { scope: 'account-a', oauthHandler: async (_req, res) => { grants++; res.end('{}'); } });
+  const options = { servername: 'platform.claude.com', method: 'POST', body: '{}' };
+  assert.equal((await request(guard, '/v1/oauth/token', options)).status, 200);
+  const refused = await request(guard, '/v1/oauth/token', { ...options, headers: { 'x-ccpick-account-scope': 'account-b' } });
+  assert.equal(refused.status, 403); assert.match(refused.body, /oauth_scope_rejected/); assert.equal(grants, 1);
+});
+
+test('selection invalidates protected passthrough only; new tunnels use the new proxy', async t => {
+  const alternativeSockets = new Set(), alternativeTargets = [];
+  const alternative = http.createServer();
+  alternative.on('connection', socket => { alternativeSockets.add(socket); socket.on('error', () => {});
+    socket.once('close', () => alternativeSockets.delete(socket)); });
+  alternative.on('connect', (req, socket) => {
+    alternativeTargets.push(req.url); socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+    socket.on('data', bytes => socket.write(bytes));
+  });
+  const alternativePort = await listen(alternative);
+  t.after(async () => { for (const socket of alternativeSockets) socket.destroy(); await new Promise(resolve => alternative.close(resolve)); });
+  let selectedProxy;
+  const resolutions = [];
+  const { guard, connects, selectorPort } = await setup(t, { resolveProxy: input => {
+    resolutions.push(input); assert.equal(input.kind, 'tunnel'); assert.equal(input.headers, undefined);
+    return { proxy: selectedProxy, revision: selectedProxy };
+  }, onConnect: (_req, socket) => {
+    socket.write('HTTP/1.1 200 Connection Established\r\n\r\n'); socket.on('data', bytes => socket.write(bytes));
+  } });
+  selectedProxy = `http://127.0.0.1:${selectorPort}`;
+  const protectedSockets = [];
+  for (const host of ['statsig.anthropic.com', 'claude.ai', 'downloads.claude.com', 'claude.app',
+    'bridge.claudeusercontent.com', 'claudemcpcontent.com'])
+    protectedSockets.push((await tunnel(guard.address().port, `${host}:443`)).socket);
+  const preserved = [];
+  for (const host of ['api.openai.com', 'downloads.example.invalid', 'anthropic.com.example.invalid'])
+    preserved.push((await tunnel(guard.address().port, `${host}:443`)).socket);
+  const closed = protectedSockets.map(socket => once(socket, 'close'));
+  selectedProxy = `http://127.0.0.1:${alternativePort}`;
+  assert.equal(guard.invalidateTunnels(), 6); await Promise.all(closed);
+  for (const socket of preserved) {
+    const echoed = once(socket, 'data'); socket.write('ordinary-still-alive');
+    assert.equal((await echoed)[0].toString(), 'ordinary-still-alive');
+  }
+  const next = (await tunnel(guard.address().port, 'statsig.anthropic.com:443')).socket;
+  const echoed = once(next, 'data'); next.write('next-household');
+  assert.equal((await echoed)[0].toString(), 'next-household');
+  assert.deepEqual(alternativeTargets, ['statsig.anthropic.com:443']); assert.equal(connects.length, 9);
+  assert.equal(resolutions.length, 10);
+  for (const socket of [...preserved, next]) socket.destroy();
+});
+
+test('invalidation cancels a protected route resolver before any upstream CONNECT', async t => {
+  const started = Promise.withResolvers(), route = Promise.withResolvers(); let resolveCalls = 0;
+  const { guard, connects, selectorPort } = await setup(t, { resolveProxy: input => {
+    resolveCalls++; started.resolve(input); return route.promise;
+  } });
+  const pending = tunnel(guard.address().port, 'statsig.anthropic.com:443').then(() => 'connected', () => 'closed');
+  const input = await started.promise;
+  assert.equal(input.signal.aborted, false); assert.equal(guard.invalidateTunnels(), 1);
+  assert.equal(await pending, 'closed'); assert.equal(input.signal.aborted, true);
+  route.resolve({ proxy: `http://127.0.0.1:${selectorPort}`, revision: 1 });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(connects.length, 0); assert.equal(resolveCalls, 1);
+});
+
+test('invalidation cancels an already dispatched protected CONNECT before late acceptance', async t => {
+  const entered = Promise.withResolvers();
+  const { guard, connects } = await setup(t, { onConnect: (_req, socket) => entered.resolve(socket) });
+  const pending = tunnel(guard.address().port, 'statsig.anthropic.com:443').then(() => 'connected', () => 'closed');
+  const upstream = await entered.promise;
+  assert.equal(connects.length, 1); assert.equal(guard.invalidateTunnels(), 1);
+  assert.equal(await pending, 'closed');
+  if (!upstream.destroyed) upstream.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(guard.status().tunneled, 0); assert.equal(connects.length, 1);
+});
+
+test('protected tunnel invalidation leaves an active intercepted model stream intact', async t => {
+  const entered = Promise.withResolvers(), release = Promise.withResolvers();
+  const { guard } = await setup(t, { messagesHandler: async (_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' }); res.write('data: before-switch\n\n');
+    entered.resolve(); await release.promise; res.end('data: after-switch\n\n');
+  } });
+  const pending = request(guard, '/v1/messages', { method: 'POST', body: '{}', headers: { 'x-ccpick-account-runtime': KEY } });
+  await entered.promise; assert.equal(guard.invalidateTunnels(), 0); release.resolve();
+  const result = await pending;
+  assert.equal(result.status, 200); assert.equal(result.body, 'data: before-switch\n\ndata: after-switch\n\n');
 });

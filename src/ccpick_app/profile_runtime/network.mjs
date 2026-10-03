@@ -27,5 +27,5 @@ export async function prepareNetwork(config, { requireBrowser = true, connect = 
     const timer = setTimeout(() => finish(true), 3000);
     socket.once('error', finish); socket.once('connect', () => finish());
   });
-  return { proxy: url.href };
+  return { apiMode: 'official', proxy: url.href };
 }

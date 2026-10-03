@@ -53,6 +53,26 @@ function assertOwner(call, owner) {
   assert.equal(call.headers.authorization, `Bearer ${owner.accessToken}`);
   assert.equal(identity.device_id, owner.deviceId); assert.equal(identity.account_uuid, owner.accountUuid);
 }
+
+test('in-flight SSE keeps frozen account and household while the next request changes both', async t => {
+  const routeA = { household: 'A', proxy: 'http://127.0.0.1:11811', revision: 'route-a' };
+  const routeB = { household: 'B', proxy: 'http://127.0.0.1:11911', revision: 'route-b' };
+  let selected = { ...a, egress: routeA };
+  const firstStream = new PassThrough(); firstStream.statusCode = 200; firstStream.headers = {};
+  const f = await fixture(t, { getSnapshot: async () => selected, transport: async input => {
+    f.calls.push(input);
+    return f.calls.length === 1 ? firstStream : response(200, 'B-result');
+  } });
+  const first = send(f.port); await until(() => f.calls.length === 1);
+  firstStream.write('A-first\n'); await first.headers;
+  selected = { ...b, egress: routeB }; routeA.proxy = routeB.proxy;
+  assert.equal((await send(f.port).result).body, 'B-result');
+  firstStream.end('A-last\n'); assert.equal((await first.result).body, 'A-first\nA-last\n');
+  assertOwner(f.calls[0], a); assertOwner(f.calls[1], b);
+  assert.equal(f.calls[0].snapshot.egress.proxy, 'http://127.0.0.1:11811');
+  assert.equal(f.calls[1].snapshot.egress.proxy, 'http://127.0.0.1:11911');
+  assert(Object.isFrozen(f.calls[0].snapshot.egress));
+});
 async function until(predicate, timeout = 2000) {
   const end = Date.now() + timeout;
   while (!predicate()) { assert(Date.now() < end, 'fixture condition timed out'); await delay(5); }

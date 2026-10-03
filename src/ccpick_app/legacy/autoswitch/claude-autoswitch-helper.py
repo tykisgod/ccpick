@@ -278,7 +278,7 @@ def cmd_accounts(_argv: list[str]) -> int:
     if mod is None:
         print(json.dumps({'error': '找不到可用的 ccpick_usage.py: %s' % why_not}, ensure_ascii=False))
         return 1
-    cached = _active_email_from_status()
+    cached = '' if '--live' in _argv else _active_email_from_status()
     if cached:
         mod.live_identity = lambda *a, **k: cached
     cap_fn = getattr(mod, 'capacity', None)
@@ -313,7 +313,7 @@ def cmd_accounts(_argv: list[str]) -> int:
         blocked, blocked_why = mod.is_blocked(row)
         plan = plans.get(str(row.get('email') or '').lower()) or {}
         cap = cap_fn(counted, plan.get('scale')) if cap_fn and counted else None
-        rows.append({'slot': row.get('slot'), 'email': row.get('email') or '?', 'active': bool(row.get('active')), 'autoSwitchEnabled': row.get('autoSwitchEnabled') is not False, 'headroom': None if worst is None else 100.0 - worst, 'cap': None if cap is None else round(cap, 1), '_err': row.get('error'), '_disabled': bool(row.get('disabled')), 'plan': plan.get('plan') or '?', 'windows': wins, 'unavailableWindows': unavailable, 'usable': bool(ok), 'why': why, 'blocked': bool(blocked), 'blockedWhy': blocked_why})
+        rows.append({'slot': row.get('slot'), 'profile': row.get('profile'), 'email': row.get('email') or '?', 'active': bool(row.get('active')), 'autoSwitchEnabled': row.get('autoSwitchEnabled') is not False, 'household': row.get('household') if row.get('household') in ('A', 'B', 'C', 'D') else None, 'householdSource': row.get('householdSource'), 'householdOptions': [group for group in row.get('householdOptions', []) if group in ('A', 'B', 'C', 'D')], 'headroom': None if worst is None else 100.0 - worst, 'cap': None if cap is None else round(cap, 1), '_err': row.get('error'), '_disabled': bool(row.get('disabled')), 'plan': plan.get('plan') or '?', 'windows': wins, 'unavailableWindows': unavailable, 'usable': bool(ok), 'why': why, 'blocked': bool(blocked), 'blockedWhy': blocked_why})
     kind = getattr(mod, 'fetch_error_kind', None)
 
     def _pts(r):

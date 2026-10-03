@@ -225,7 +225,7 @@ function Invoke-Check() {
 }
 
 function Update-Accounts() {
-    if (-not $script:PYW) { return }
+    if ($script:AccountsInFlight -or -not $script:PYW) { return }
     if (-not (Test-Path -LiteralPath $HELPER)) { return }
     $script:AccountsInFlight = $true
     $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -235,15 +235,50 @@ function Update-Accounts() {
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
     $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+    $psi.RedirectStandardError = $true
+    $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+    $psi.EnvironmentVariables['PYTHONIOENCODING'] = 'utf-8'
     try {
         $p = [System.Diagnostics.Process]::Start($psi)
-        $t = $p.StandardOutput.ReadToEndAsync()
-        if ($p.WaitForExit(20000)) {
-            $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-            [System.IO.File]::WriteAllText($ACCTS, $t.Result, $utf8NoBom)
-        }
-    } catch { Write-TrayLog "WARN 读账号列表失败: $($_.Exception.Message)" }
-    $script:AccountsInFlight = $false
+        $identity = $null
+        try { $identity = @{ id = $p.Id; start = $p.StartTime.ToUniversalTime().Ticks } } catch { }
+        $script:AccountsRefresh = @{ process = $p; output = $p.StandardOutput.ReadToEndAsync();
+            error = $p.StandardError.ReadToEndAsync(); startedAt = [DateTime]::UtcNow; identity = $identity }
+    } catch { $script:AccountsInFlight = $false; Write-TrayLog 'WARN 账号列表刷新未开始' }
+}
+
+function Stop-AccountsRefreshWorker($pending) {
+    if (-not $pending.identity -or $pending.process.HasExited -or $pending.process.Id -ne $pending.identity.id) { return }
+    $current = $null
+    try {
+        $current = Get-Process -Id $pending.identity.id -ErrorAction Stop
+        if ($current.StartTime.ToUniversalTime().Ticks -eq $pending.identity.start) { $pending.process.Kill() }
+    } catch { }
+    finally { if ($current) { $current.Dispose() } }
+}
+
+function Complete-AccountsRefresh {
+    if (-not $script:AccountsRefresh) { return }
+    if (-not $script:AccountsRefresh.process.HasExited -or
+        -not $script:AccountsRefresh.output.IsCompleted -or -not $script:AccountsRefresh.error.IsCompleted) {
+        if (([DateTime]::UtcNow - $script:AccountsRefresh.startedAt).TotalSeconds -lt 20) { return }
+        $expired = $script:AccountsRefresh
+        $script:AccountsRefresh = $null; $script:AccountsInFlight = $false
+        try { Stop-AccountsRefreshWorker $expired }
+        finally { $expired.process.Dispose() }
+        Write-TrayLog 'WARN 账号列表刷新超时，保留上次列表并允许重试'
+        return
+    }
+    $pending = $script:AccountsRefresh
+    $script:AccountsRefresh = $null
+    try {
+        if ($pending.process.ExitCode -ne 0) { throw 'account_list_failed' }
+        $value = $pending.output.Result | ConvertFrom-Json -ErrorAction Stop
+        if (-not ($value.PSObject.Properties.Name -contains 'accounts')) { throw 'account_list_invalid' }
+        [System.IO.File]::WriteAllText($ACCTS, $pending.output.Result, (New-Object System.Text.UTF8Encoding($false)))
+        if ($script:Menu.Visible) { Build-Menu }
+    } catch { Write-TrayLog 'WARN 账号列表未能刷新，保留上次列表' }
+    finally { $script:AccountsInFlight = $false; $pending.process.Dispose() }
 }
 
 function Read-Accounts {
@@ -269,6 +304,7 @@ function Get-SelectedEmail($accounts, $snapshot) {
 }
 
 function Switch-To([string]$email) {
+    if ($script:SwitchAction) { Show-TrayBalloon '正在切换账号' '请等待当前切换完成。'; return }
     $entry = Join-Path (Split-Path -Parent $Shared) "ccpick.py"
     if (-not $script:PYW -or -not (Test-Path -LiteralPath $entry)) {
         Write-TrayLog "WARN 找不到受控切号入口"; return
@@ -277,9 +313,100 @@ function Switch-To([string]$email) {
         Write-TrayLog "WARN 无效的本机账号标识"; return
     }
     Write-TrayLog "手动受控切号"
-    Start-Detached $script:PYW ('"{0}" switch "{1}"' -f $entry, $email)
-    Start-Sleep -Milliseconds 1500
-    Invoke-Check
+    try {
+        $script:SwitchAction = Start-SwitchProcess $entry $email
+        Show-TrayBalloon '正在切换账号' '正在检查目标账号及家宽线路；完成后会通知。'
+    } catch { Show-TrayBalloon '切换未开始' '无法启动账号管理器，请在终端重试。' }
+}
+
+function Start-SwitchProcess([string]$entry, [string]$email) {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $script:PYW
+    $psi.Arguments = '"{0}" switch "{1}"' -f $entry, $email
+    $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+    $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+    $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+    $psi.EnvironmentVariables['PYTHONIOENCODING'] = 'utf-8'
+    $p = [System.Diagnostics.Process]::Start($psi)
+    return @{ process = $p; output = $p.StandardOutput.ReadToEndAsync();
+        error = $p.StandardError.ReadToEndAsync(); email = $email }
+}
+
+function Get-SwitchFailureMessage([string]$text) {
+    $messages = @{
+        login_required = '目标账号尚未完成授权，请重新登录该账号。'
+        wrong_account = '授权账号与所选条目不一致，请确认登录的邮箱。'
+        auth_renewal_failed = '目标账号需要重新授权，请重新登录该账号。'
+        auth_unverified = '目标账号尚未通过认证检查，请在终端查看结果。'
+        profile_busy = '目标账号正在登录，请完成登录后重试。'
+        readiness_busy = '目标账号正在验证，请稍后重试。'
+        house_service_not_ready = '目标家宽线路尚未就绪，请稍后重试。'
+        network_not_ready = '目标家宽线路检查未通过，请稍后重试。'
+        local_runtime_unavailable = '账号服务检查未完成，请在终端重试。'
+    }
+    if ($text -match '\[([a-z_]{1,80})\]\s*$' -and $messages.ContainsKey($Matches[1])) { return $messages[$Matches[1]] }
+    return '未能确认切号结果，请在终端查看具体结果。'
+}
+
+function Start-SwitchConfirmation([string]$email) {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $script:PYW
+    $psi.Arguments = ('"{0}" accounts' -f $HELPER)
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+    $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+    $psi.EnvironmentVariables['PYTHONIOENCODING'] = 'utf-8'
+    $process = [System.Diagnostics.Process]::Start($psi)
+    $identity = $null
+    try { $identity = @{ id = $process.Id; start = $process.StartTime.ToUniversalTime().Ticks } } catch { }
+    return @{ process = $process; output = $process.StandardOutput.ReadToEndAsync();
+        error = $process.StandardError.ReadToEndAsync(); email = $email; confirmation = $true;
+        startedAt = [DateTime]::UtcNow; identity = $identity }
+}
+
+function Complete-SwitchAction {
+    if (-not $script:SwitchAction) { return }
+    $pending = $script:SwitchAction
+    if (-not $pending.process.HasExited -or -not $pending.output.IsCompleted -or
+        -not $pending.error.IsCompleted) {
+        if ($pending.confirmation -and ([DateTime]::UtcNow - $pending.startedAt).TotalSeconds -ge 20) {
+            $script:SwitchAction = $null
+            try { Stop-AccountsRefreshWorker $pending }
+            finally { $pending.process.Dispose() }
+            Show-TrayBalloon '切号确认未完成' '账号列表读取超时，请在终端确认当前账号。'
+            Update-Accounts
+        }
+        return
+    }
+    $script:SwitchAction = $null
+    try {
+        if (-not $pending.confirmation -and $pending.process.ExitCode -eq 0) {
+            $script:SwitchAction = Start-SwitchConfirmation $pending.email
+            return
+        }
+        $selected = ''
+        if ($pending.confirmation -and $pending.process.ExitCode -eq 0) {
+            $accounts = $pending.output.Result | ConvertFrom-Json -ErrorAction Stop
+            $selected = Get-SelectedEmail $accounts $null
+        }
+        if ($pending.confirmation -and $selected -ceq $pending.email) {
+            Write-TrayLog '手动切号已确认'
+            $script:LastKnownEmail = $selected
+            Show-TrayBalloon 'Claude 账号已切换' ('现在：' + $selected)
+        } else {
+            Write-TrayLog '手动切号未完成'
+            Show-TrayBalloon '切号未完成' (Get-SwitchFailureMessage $pending.error.Result)
+        }
+        Update-Accounts
+    } catch {
+        Write-TrayLog '手动切号结果读取未完成'
+        Show-TrayBalloon '切号确认未完成' '无法读取当前账号，请在终端确认切号结果。'
+        Update-Accounts
+    } finally { $pending.process.Dispose() }
 }
 
 $script:Notify = New-Object System.Windows.Forms.NotifyIcon
@@ -287,6 +414,8 @@ $script:CurState = ""
 $script:LastCheckAt = [DateTime]::MinValue
 $script:NextIntervalS = 60
 $script:AccountsInFlight = $false
+$script:AccountsRefresh = $null
+$script:SwitchAction = $null
 
 $script:Menu = New-Object System.Windows.Forms.ContextMenuStrip
 $script:Notify.ContextMenuStrip = $script:Menu
@@ -429,6 +558,7 @@ function Build-Menu {
                 try { $tags += ("{0:F0} 点" -f [double]$a.cap) } catch { }
             }
             if ($manualOnly) { $tags += "仅手动" }
+            if (($a.PSObject.Properties.Name -contains 'household') -and $a.household -cmatch '^[ABCD]$') { $tags += '家宽 ' + $a.household }
             if ($tags.Count -gt 0) { $label = $label + "    " + ($tags -join " · ") }
 
             $blocked = $false
@@ -455,7 +585,7 @@ function Build-Menu {
                 try { Switch-To $target }
                 catch { Write-TrayLog ("切到 " + $target + " 出错: " + $_.Exception.Message) }
             })
-            if ($isSelected) { $mi.Enabled = $false }
+            if ($isSelected -or $script:SwitchAction) { $mi.Enabled = $false }
             [void]$script:Menu.Items.Add($mi)
 
             if ($a.PSObject.Properties.Name -contains "windows") {
@@ -511,6 +641,7 @@ function Add-Actions {
 
 $script:Menu.add_Opening({
     try {
+        Update-Accounts
         Build-Menu
     } catch {
         $msg = $_.Exception.Message
@@ -540,7 +671,7 @@ $iconTimer.Add_Tick({
         [System.Windows.Forms.Application]::Exit()
         return
     }
-    try { Update-Icon } catch { Write-TrayLog ("图标轮次出错: " + $_.Exception.Message) }
+    try { Complete-AccountsRefresh; Complete-SwitchAction; Update-Icon } catch { Write-TrayLog ("图标轮次出错: " + $_.Exception.Message) }
 })
 $script:LastKnownEmail = $null
 $script:NotifiedFile = Join-Path $Root ".notified"

@@ -275,8 +275,8 @@ def _windows_assets(legacy: Path, service_root: Path, state_root: Path) -> dict[
     source = source[:start] + "function Resolve-Python { return " + _ps_quote(sys.executable) + " }\n" + source[end:]
     source = _replace_once(source, '$entry = Join-Path (Split-Path -Parent $Shared) "ccpick.py"',
                            "$entry = " + _ps_quote(sys.executable))
-    source = _replace_once(source, 'Start-Detached $script:PYW (\'"{0}" switch "{1}"\' -f $entry, $email)',
-                           'Start-Detached $script:PYW (\'-m ccpick_app switch "{0}"\' -f $email)')
+    source = _replace_once(source, '$psi.Arguments = \'"{0}" switch "{1}"\' -f $entry, $email',
+                           '$psi.Arguments = \'-m ccpick_app switch "{0}"\' -f $email')
     # All children, including helper and manual backend actions, share the configured state root.
     source = _replace_once(source, '$ErrorActionPreference = "Continue"',
                            '$ErrorActionPreference = "Continue"\n$env:CCPICK_DATA_DIR = ' + _ps_quote(runtime.data_dir()))
@@ -287,7 +287,9 @@ def _windows_assets(legacy: Path, service_root: Path, state_root: Path) -> dict[
             "if ($ForceCheck) { $params += '--force-check' }\n"
             "& " + _ps_quote(sys.executable) + " @params\nexit $LASTEXITCODE\n")
     helper = ("from ccpick_app.service import main\n"
-              "import sys\nraise SystemExit(main(['_helper', *sys.argv[1:]]))\n")
+              "import sys\nargs = sys.argv[1:]\n"
+              "if args[:1] == ['accounts']: args.append('--live')\n"
+              "raise SystemExit(main(['_helper', *args]))\n")
     return {"claude-autoswitch-tray.ps1": source, "claude-account-autoswitch.ps1": tick,
             "claude-autoswitch-helper.py": helper}
 
@@ -326,7 +328,9 @@ def _mac_assets(legacy: Path, service_root: Path, state_root: Path) -> dict[str,
                             'item.autosaveName = "io.github.tykisgod.ccpick.menubar.item"', source)
     if count != 1:
         raise RuntimeError("Packaged menu-bar autosave identifier changed")
-    helper = "from ccpick_app.service import main\nimport sys\nraise SystemExit(main(['_helper', *sys.argv[1:]]))\n"
+    helper = ("from ccpick_app.service import main\nimport sys\nargs = sys.argv[1:]\n"
+              "if args[:1] == ['accounts']: args.append('--live')\n"
+              "raise SystemExit(main(['_helper', *args]))\n")
     tick = ("#!/bin/sh\nexport CCPICK_DATA_DIR=" + shlex.quote(str(runtime.data_dir())) + "\n"
             "case \"${1:-}\" in --now) shift;; --force-check|'') ;; *) exit 2;; esac\n"
             "exec " + shlex.quote(sys.executable) + " -m ccpick_app.service tick \"$@\"\n")

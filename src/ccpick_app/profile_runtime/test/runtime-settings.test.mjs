@@ -26,7 +26,8 @@ test('private runtime settings preserve native preferences and restore each scop
   const f = await fixture(t);
   const source = { language: '简体中文', hooks: { Stop: [{ hooks: [{ type: 'command', command: 'fixture-stop' }] }] },
     env: { FIXTURE_PREFERENCE: 'keep', HTTPS_PROXY: 'http://127.0.0.1:1510',
-      anthropic_base_url: 'https://old.invalid', ANTHROPIC_CUSTOM_HEADERS: 'fixture-old-scope-capability' } };
+      anthropic_base_url: 'https://old.invalid', ANTHROPIC_CUSTOM_HEADERS: 'fixture-old-scope-capability',
+      CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP: '0', claude_code_disable_bg_shell_pressure_reap: '0' } };
   const vault = path.join(f.root, 'account-vault.json'); await atomicJson(vault, source);
   const sourceBytes = await fs.readFile(vault);
   for (const scope of ['default', 'account-a']) {
@@ -37,8 +38,11 @@ test('private runtime settings preserve native preferences and restore each scop
     assert.equal(settings.env.FIXTURE_PREFERENCE, 'keep');
     assert.equal(settings.env.HTTPS_PROXY, source.env.HTTPS_PROXY);
     assert.equal(settings.env.anthropic_base_url, undefined);
+    assert.equal(settings.env.CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP, '1');
+    assert.equal(settings.env.claude_code_disable_bg_shell_pressure_reap, undefined);
     const daemonChild = { HTTPS_PROXY: source.env.HTTPS_PROXY, NODE_EXTRA_CA_CERTS: 'fixture-ca' };
     const worker = { ...daemonChild, ...settings.env };
+    assert.equal(worker.CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP, '1');
     assert.equal(worker.ANTHROPIC_CUSTOM_HEADERS, expected.ANTHROPIC_CUSTOM_HEADERS);
     assert.equal(worker.ANTHROPIC_BASE_URL, expected.ANTHROPIC_BASE_URL);
     assert.equal(worker.NODE_EXTRA_CA_CERTS, daemonChild.NODE_EXTRA_CA_CERTS);
@@ -46,6 +50,7 @@ test('private runtime settings preserve native preferences and restore each scop
     validateSettings(settings, worker, f.config);
     assert.throws(() => validateSettings({ env: { HTTPS_PROXY: 'http://wrong.invalid' } }, worker, f.config), /settings_conflict/);
     assert.throws(() => validateSettings({ env: { ANTHROPIC_CUSTOM_HEADERS: 'fixture-wrong-scope' } }, worker, f.config), /settings_conflict/);
+    assert.throws(() => validateSettings({ env: { CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP: '0' } }, worker, f.config), /settings_conflict/);
     const stat = await fs.stat(file), bytes = await fs.readFile(file);
     assert.equal(await syncRuntimeSettings(f.config, f.service, scope), false);
     assert.equal((await fs.stat(file)).mtimeMs, stat.mtimeMs);
@@ -53,6 +58,25 @@ test('private runtime settings preserve native preferences and restore each scop
     if (process.platform !== 'win32') assert.equal(stat.mode & 0o077, 0);
   }
   assert.deepEqual(await fs.readFile(vault), sourceBytes);
+});
+
+test('per-scope proxy settings replace every old transport alias while keeping user preferences', async t => {
+  const f = await fixture(t), scope = 'account-a';
+  const service = { ...f.service, egressVersion: 1, proxyPort: 12341, scopeProxyPorts: { [scope]: 12342 } };
+  const env = { FIXTURE_PREFERENCE: 'kept' };
+  for (const key of ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'WS_PROXY', 'WSS_PROXY', 'NO_PROXY']) {
+    env[key] = 'old'; env[key.toLowerCase()] = 'old lowercase';
+  }
+  const file = path.join(f.directory(scope), 'settings.json'); await atomicJson(file, { env });
+  await syncRuntimeSettings(f.config, service, scope);
+  const updated = (await readJson(file)).env;
+  for (const key of ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'WS_PROXY', 'WSS_PROXY']) {
+    assert.equal(updated[key], 'http://127.0.0.1:12342'); assert.equal(updated[key.toLowerCase()], undefined);
+  }
+  assert.equal(updated.NO_PROXY, '127.0.0.1,localhost,::1'); assert.equal(updated.no_proxy, undefined);
+  assert.equal(updated.FIXTURE_PREFERENCE, 'kept');
+  assert.equal(runtimeSettingsEnvironment(service).HTTPS_PROXY, 'http://127.0.0.1:12341');
+  for (const proxyPort of [0, 65536, '12341']) assert.throws(() => runtimeSettingsEnvironment({ ...service, proxyPort }), /runtime_service_invalid/);
 });
 
 test('runtime settings refuse malformed private files and unsafe scope paths without publishing capabilities', async t => {

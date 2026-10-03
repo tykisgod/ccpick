@@ -128,7 +128,7 @@ test('a clean unbound account can start the service, register an enrollment scop
   let externalCalls = 0;
   const values = new Map();
   const service = await serveRuntime(config, {
-    network: async () => ({ proxy: 'http://127.0.0.1:1' }),
+    network: async () => ({ apiMode: 'official', proxy: 'http://127.0.0.1:1' }),
     store: { read: async directory => structuredClone(values.get(directory) ?? {}),
       write: async (directory, value) => values.set(directory, structuredClone(value)) },
     requestAccount: async () => { externalCalls++; throw new Error('fixture_external_request_refused'); },

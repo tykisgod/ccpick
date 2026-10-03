@@ -29,11 +29,12 @@ async function until(predicate, message = 'fixture condition timed out') {
   const deadline = Date.now() + 2500;
   while (!await predicate()) { assert(Date.now() < deadline, message); await delay(5); }
 }
-async function fixture(t, overrides = {}) {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ccpick-service-test-'));
+async function fixture(t, overrides = {}, { unboundProfiles = [] } = {}) {
+  const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'ccpick-service-test-')));
   if (process.platform !== 'win32') await fs.chmod(root, 0o700);
   const config = { serviceRoot: root, dataRoot: path.join(root, 'profiles', 'data'), seamlessAccounts: true,
-    native: path.join(root, 'never-run-native'), browser: path.join(root, 'never-run-browser'), platform: process.platform };
+    native: path.join(root, 'never-run-native'), browser: path.join(root, 'never-run-browser'), platform: process.platform,
+    networkProfile: 'primary' };
   await fs.mkdir(config.dataRoot, { recursive: true, mode: 0o700 });
   const values = new Map(), writes = [], calls = [], accountCalls = [], services = [], profiles = {};
   const signalBefore = new Map(['SIGTERM', 'SIGINT'].map(name => [name, process.listeners(name)]));
@@ -47,16 +48,19 @@ async function fixture(t, overrides = {}) {
       initialize: async (_, target) => atomicJson(globalConfigFile(target), { userID: randomBytes(32).toString('hex'),
         machineID: randomBytes(32).toString('hex'), preference: 'kept' }),
     });
-    const ids = await readJson(globalConfigFile(p)), remote = profile(label);
-    await atomicJson(globalConfigFile(p), { ...ids, oauthAccount: { accountUuid: remote.account.uuid,
-      organizationUuid: remote.organization.uuid, emailAddress: remote.account.email } });
-    await bindAccount(config, p, { loggedIn: true, uuid: remote.account.uuid, email: remote.account.email });
-    p = await getProfile(config, p.name); profiles[label] = p; values.set(p.configDirectory, grant(label));
+    if (!unboundProfiles.includes(label)) {
+      const ids = await readJson(globalConfigFile(p)), remote = profile(label);
+      await atomicJson(globalConfigFile(p), { ...ids, oauthAccount: { accountUuid: remote.account.uuid,
+        organizationUuid: remote.organization.uuid, emailAddress: remote.account.email } });
+      await bindAccount(config, p, { loggedIn: true, uuid: remote.account.uuid, email: remote.account.email });
+      values.set(p.configDirectory, grant(label));
+    }
+    p = await getProfile(config, p.name); profiles[label] = p;
   }
   await atomicJson(path.join(config.dataRoot, '..', 'state.json'), { version: 2, enabled: true,
     selected: profiles.A.name, selectedAt: 'fixture-generation-A', bootstrapEmail: 'fixture@example.com' });
   const defaults = {
-    network: async () => ({ proxy: 'http://127.0.0.1:1' }), store,
+    network: async () => ({ proxy: 'http://127.0.0.1:1', apiMode: 'official' }), store,
     certificateFactory: async directory => (f.certificate = await runtimeCertificate(directory)),
     requestAccount: async (proxy, kind, options) => {
       accountCalls.push({ proxy, kind, options });
@@ -79,9 +83,10 @@ async function fixture(t, overrides = {}) {
       response.on('end', () => resolve({ status: response.statusCode, value: JSON.parse(Buffer.concat(parts)) }));
     }); request.once('error', reject); request.end(JSON.stringify(input));
   });
-  f.request = async (route, { host = 'api.anthropic.com', headers = {}, body = '', method = 'POST' } = {}) => {
+  f.request = async (route, { host = 'api.anthropic.com', headers = {}, body = '', method = 'POST',
+    proxyPort = f.service.guard.address().port } = {}) => {
     const socket = await new Promise((resolve, reject) => {
-      const request = http.request({ hostname: '127.0.0.1', port: f.service.guard.address().port,
+      const request = http.request({ hostname: '127.0.0.1', port: proxyPort,
         method: 'CONNECT', path: `${host}:443`, headers: { host: `${host}:443` }, agent: false });
       request.once('error', reject); request.once('connect', (response, tunnel) => {
         if (response.statusCode !== 200) { tunnel.destroy(); reject(new Error('fixture_connect_refused')); }
@@ -101,7 +106,7 @@ async function fixture(t, overrides = {}) {
       });
     } finally { agent.destroy(); secure.destroy(); }
   };
-  f.model = scope => f.request('/v1/messages?beta=true', { headers: { authorization: `Bearer ${f.key}`,
+  f.model = (scope, proxyPort) => f.request('/v1/messages?beta=true', { proxyPort, headers: { authorization: `Bearer ${f.key}`,
     'x-ccpick-account-runtime': f.key, 'x-ccpick-account-scope': scope ?? 'default' }, body: JSON.stringify({
       model: 'claude-fixture', messages: [{ role: 'user', content: 'same conversation' }],
       metadata: { user_id: JSON.stringify({ device_id: '', account_uuid: '', session_id: 'same-session' }) }, stream: true,
@@ -128,6 +133,260 @@ async function exchangeLogin(f) {
     grant_type: 'authorization_code', code: 'INVENTED-CODE', state, code_verifier: verifier,
   }) });
 }
+
+async function configureGroups(f, proxies = { A: 'http://127.0.0.1:1', B: 'http://127.0.0.1:2' }) {
+  f.groupBRoot = path.join(f.root, 'house-b');
+  await fs.mkdir(f.groupBRoot, { mode: 0o700, recursive: true });
+  await fs.mkdir(path.join(f.config.serviceRoot, 'config'), { mode: 0o700, recursive: true });
+  const groups = {
+    A: { serviceRoot: f.config.serviceRoot, networkProfile: 'primary' },
+    B: { serviceRoot: f.groupBRoot, networkProfile: 'primary' },
+  };
+  if (proxies.C) {
+    f.groupCRoot = path.join(f.root, 'house-c');
+    await fs.mkdir(f.groupCRoot, { mode: 0o700 });
+    groups.C = { serviceRoot: f.groupCRoot, networkProfile: 'household-c' };
+  }
+  if (proxies.D) {
+    f.groupDRoot = path.join(f.root, 'house-d');
+    await fs.mkdir(f.groupDRoot, { mode: 0o700 });
+    groups.D = { serviceRoot: f.groupDRoot, networkProfile: 'household-d' };
+  }
+  await atomicJson(path.join(f.config.serviceRoot, 'config', 'account-egress.json'), { version: 1, defaultGroup: 'A', groups });
+  await atomicJson(path.join(f.profiles.B.root, 'egress-policy.json'), { version: 1, household: 'B' });
+  return { network: async config => ({ proxy: proxies[config.serviceRoot === f.groupBRoot ? 'B' :
+    config.serviceRoot === f.groupCRoot ? 'C' : config.serviceRoot === f.groupDRoot ? 'D' : 'A'], apiMode: 'official' }) };
+}
+
+for (const household of ['C', 'D']) test(`${household} account route carries model, actual-bearer usage and OAuth while preserving A selection and scope ports`, async t => {
+  const api = [], f = await fixture(t, { apiHandler: async (input, response) => { api.push(input); response.end('{}'); } });
+  const dependencies = await configureGroups(f, { A: 'http://127.0.0.1:1', B: 'http://127.0.0.1:2', [household]: 'http://127.0.0.1:3' });
+  await f.start(dependencies);
+  const pinned = (await f.control('/register', { scope: 'account-b' })).value;
+  const defaultPort = f.service.guard.address().port;
+  assert.deepEqual(pinned.householdOptions, ['A', 'B', household]);
+  assert.equal((await f.control('/egress-set', { name: 'account-b', household })).status, 200);
+  assert.equal((await registryState(f.config)).selected, 'account-a');
+  assert.equal((await f.model('account-b', pinned.proxyPort)).status, 200);
+  assertOwner(f.calls.at(-1), 'B');
+  assert.equal(f.calls.at(-1).snapshot.egress.household, household);
+  assert.equal(f.calls.at(-1).snapshot.egress.proxy, 'http://127.0.0.1:3');
+  assert.equal((await f.request('/api/oauth/usage', { proxyPort: pinned.proxyPort, method: 'GET',
+    headers: { authorization: 'Bearer INVENTED-B-ACCESS' } })).status, 200);
+  assert.equal(api.at(-1).proxy, 'http://127.0.0.1:3/');
+  assert.deepEqual((await f.control('/browser-route', { scope: 'account-b' })).value,
+    { ok: true, household, scope: 'account-b' });
+  const state = 'fixture-C-state', verifier = 'fixture-C-verifier';
+  const begin = await f.control('/login-begin', { scope: 'account-b', sessionId: 'fixture-C-session', oauthState: state,
+    oauthChallenge: createHash('sha256').update(verifier).digest('base64url') });
+  assert.equal(begin.value.household, household);
+  assert.equal((await f.request('/v1/oauth/token', { host: 'platform.claude.com', proxyPort: pinned.proxyPort,
+    body: JSON.stringify({ grant_type: 'authorization_code', code: 'INVENTED-C-CODE', state, code_verifier: verifier }) })).status, 200);
+  assert.equal(f.accountCalls.find(call => call.kind === 'login').proxy, 'http://127.0.0.1:3');
+  const pending = f.writes.find(value => value.value.oauthResponse);
+  assert.equal((await readJson(path.join(pending.directory, 'record.json'))).household, household);
+  await f.service.close(); await f.start(dependencies);
+  assert.equal(f.service.guard.address().port, defaultPort);
+  assert.equal((await f.control('/register', { scope: 'account-b' })).value.proxyPort, pinned.proxyPort);
+  assert.equal((await registryState(f.config)).selected, 'account-a');
+});
+
+for (const household of ['C', 'D']) test(`${household} published after startup is rejected until the service loads its topology`, async t => {
+  const f = await fixture(t); await f.start(await configureGroups(f));
+  await configureGroups(f, { A: 'http://127.0.0.1:1', B: 'http://127.0.0.1:2', [household]: 'http://127.0.0.1:3' });
+  const result = await f.control('/egress-set', { name: 'account-b', household });
+  assert.equal(result.status, 409);
+  assert.equal(result.value.reason, 'egress_client_upgrade_required');
+  assert.equal((await readJson(path.join(f.profiles.B.root, 'egress-policy.json'))).household, 'B');
+  assert.equal((await f.control('/status')).value.householdOptions.includes(household), false);
+});
+
+async function tunnelProxy(t) {
+  const admitted = [], sockets = new Set();
+  const server = http.createServer();
+  server.on('connect', (request, socket) => {
+    admitted.push(request.url); sockets.add(socket); socket.on('close', () => sockets.delete(socket));
+    socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(async () => { for (const socket of sockets) socket.destroy(); await new Promise(resolve => server.close(resolve)); });
+  return { proxy: `http://127.0.0.1:${server.address().port}`, admitted };
+}
+async function openTunnel(port, hostname) {
+  return new Promise((resolve, reject) => {
+    const request = http.request({ host: '127.0.0.1', port, method: 'CONNECT', path: `${hostname}:443`, agent: false });
+    request.on('error', reject); request.on('connect', (response, socket) => {
+      if (response.statusCode !== 200) { socket.destroy(); reject(new Error('fixture_connect_refused')); return; }
+      socket.on('error', () => {}); resolve(socket);
+    }); request.end();
+  });
+}
+
+test('multiple groups bind independent scope ports and route auxiliary API by actual bearer', async t => {
+  const api = [];
+  const f = await fixture(t, { apiHandler: async (input, response) => {
+    api.push(input); response.end('{}');
+  } });
+  const dependencies = await configureGroups(f); await f.start(dependencies);
+  const pinned = (await f.control('/register', { scope: 'account-b' })).value;
+  assert.notEqual(pinned.proxyPort, f.service.guard.address().port);
+  assert.deepEqual((await f.control('/browser-route', { scope: 'account-b' })).value, { ok: true, household: 'B', scope: 'account-b' });
+  assert.deepEqual((await f.control('/browser-route')).value, { ok: true, household: 'A', scope: 'default' });
+  assert.equal((await f.model('account-b', pinned.proxyPort)).status, 200);
+  assertOwner(f.calls.at(-1), 'B'); assert.equal(f.calls.at(-1).snapshot.egress.household, 'B');
+  assert.equal(f.calls.at(-1).snapshot.egress.proxy, 'http://127.0.0.1:2');
+  assert.equal((await f.model()).status, 200); assertOwner(f.calls.at(-1), 'A');
+  await f.control('/ready', { name: 'account-a' });
+  assert.equal((await f.request('/api/oauth/usage', { proxyPort: pinned.proxyPort, method: 'GET',
+    headers: { authorization: 'Bearer INVENTED-A-ACCESS' } })).status, 200);
+  assert.equal(api.at(-1).proxy, 'http://127.0.0.1:1/');
+  assert.equal(api.at(-1).headers.authorization, 'Bearer INVENTED-A-ACCESS');
+  const rejected = await f.model('account-b');
+  assert.equal(rejected.status, 403);
+  assert.equal(f.calls.at(-1).snapshot.profileId, 'account-a');
+  const settings = await readJson(path.join(pinned.directory, 'settings.json'));
+  for (const key of ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'WS_PROXY', 'WSS_PROXY'])
+    assert.equal(settings.env[key], `http://127.0.0.1:${pinned.proxyPort}`);
+  const ports = await readJson(path.join(runtimeRoot(f.config), 'scope-proxy-ports.json'));
+  assert.equal(ports.ports['account-b'], pinned.proxyPort);
+  const defaultPort = f.service.guard.address().port;
+  await f.service.close(); await f.start(dependencies);
+  assert.equal(f.service.guard.address().port, defaultPort);
+  assert.equal((await f.control('/register', { scope: 'account-b' })).value.proxyPort, pinned.proxyPort);
+  assert.equal((await f.model('account-b', pinned.proxyPort)).status, 200); assertOwner(f.calls.at(-1), 'B');
+});
+
+test('same scope switches accounts and households without changing an admitted model snapshot', async t => {
+  let release, started = false;
+  const f = await fixture(t, { brokerTransport: async input => {
+    f.calls.push(input);
+    if (f.calls.length === 1) { started = true; await new Promise(resolve => { release = resolve; }); }
+    return streamResponse(input.snapshot.profileId);
+  } });
+  await f.start(await configureGroups(f));
+  const first = f.model(); await until(() => started);
+  assert.equal((await f.control('/select', { name: 'account-b' })).status, 200);
+  assert.equal((await f.model()).status, 200);
+  assertOwner(f.calls[0], 'A'); assertOwner(f.calls[1], 'B');
+  assert.equal(f.calls[0].snapshot.egress.household, 'A');
+  assert.equal(f.calls[1].snapshot.egress.household, 'B');
+  release(); assert.equal((await first).body, 'account-a');
+  assert.equal((await f.control('/egress-set', { name: 'account-b', household: 'A' })).status, 200);
+  assert.equal((await f.model()).status, 200); assertOwner(f.calls.at(-1), 'B');
+  assert.equal(f.calls.at(-1).snapshot.egress.household, 'A');
+});
+
+test('route publication closes only affected opaque Anthropic tunnels before control response', async t => {
+  const a = await tunnelProxy(t), b = await tunnelProxy(t), f = await fixture(t);
+  await f.start(await configureGroups(f, { A: a.proxy, B: b.proxy }));
+  const defaultPort = f.service.guard.address().port;
+  const pinned = (await f.control('/register', { scope: 'account-b' })).value;
+  const protectedA = await openTunnel(defaultPort, 'claude.ai');
+  const ordinary = await openTunnel(defaultPort, 'downloads.example.com');
+  const protectedB = await openTunnel(pinned.proxyPort, 'claude.ai');
+  const openAI = await openTunnel(pinned.proxyPort, 'api.openai.com');
+  t.after(() => { for (const socket of [protectedA, ordinary, protectedB, openAI]) socket.destroy(); });
+  let ended = false; protectedA.on('end', () => { ended = true; }); protectedA.resume();
+  assert.equal((await f.control('/egress-set', { name: 'account-a', household: 'B' })).status, 200);
+  await until(() => ended);
+  assert.equal(ordinary.destroyed, false); assert.equal(protectedB.destroyed, false); assert.equal(openAI.destroyed, false);
+  assert(a.admitted.includes('api.openai.com:443'));
+  assert.equal(b.admitted.includes('api.openai.com:443'), false);
+  const next = await openTunnel(defaultPort, 'claude.ai'); t.after(() => next.destroy());
+  assert.equal(b.admitted.filter(value => value === 'claude.ai:443').length, 2);
+});
+
+test('scope-bound OAuth enforces PKCE ownership and persists household through journal recovery', async t => {
+  const f = await fixture(t); const dependencies = await configureGroups(f); await f.start(dependencies);
+  const pinned = (await f.control('/register', { scope: 'account-b' })).value;
+  const state = 'fixture-B-state', verifier = 'fixture-B-verifier';
+  const begin = await f.control('/login-begin', { scope: 'account-b', sessionId: 'fixture-B-session', oauthState: state,
+    oauthChallenge: createHash('sha256').update(verifier).digest('base64url') });
+  assert.equal(begin.value.household, 'B');
+  const body = JSON.stringify({ grant_type: 'authorization_code', code: 'INVENTED-B-CODE', state, code_verifier: verifier });
+  assert.equal((await f.request('/v1/oauth/token', { host: 'platform.claude.com', body })).status, 409);
+  assert.equal(f.accountCalls.filter(call => call.kind === 'login').length, 0);
+  assert.equal((await f.request('/v1/oauth/token', { host: 'platform.claude.com', proxyPort: pinned.proxyPort, body })).status, 200);
+  assert.equal(f.accountCalls.find(call => call.kind === 'login').proxy, 'http://127.0.0.1:2');
+  const pending = f.writes.find(value => value.value.oauthResponse);
+  assert.equal((await readJson(path.join(pending.directory, 'record.json'))).household, 'B');
+  await f.service.close(); await f.start(dependencies);
+  assert.equal((await registryState(f.config)).selected, 'account-a');
+  assert.deepEqual(f.values.get(pending.directory), {});
+  assert(f.accountCalls.filter(call => call.kind === 'profile' && call.options.token.includes('-B-'))
+    .every(call => call.proxy === 'http://127.0.0.1:2'));
+});
+
+test('legacy live pinned clients fail closed before adopting scope guards while default clients remain compatible', async t => {
+  const f = await fixture(t); await f.start(); await f.service.close();
+  const serviceFile = path.join(runtimeRoot(f.config), 'service.json'), previous = await readJson(serviceFile);
+  delete previous.egressVersion; await atomicJson(serviceFile, previous);
+  const dependencies = await configureGroups(f);
+  await atomicJson(path.join(runtimeRoot(f.config), 'leases', 'fixture.json'), {
+    scope: 'account-b', childPid: process.pid, wrapperPid: process.pid, status: 'running',
+  });
+  await assert.rejects(f.start(dependencies), /egress_client_upgrade_required/);
+  await atomicJson(path.join(runtimeRoot(f.config), 'leases', 'fixture.json'), {
+    scope: 'default', childPid: process.pid, wrapperPid: process.pid, status: 'running',
+  });
+  await f.start(dependencies);
+  assert.equal(f.service.guard.address().port, previous.proxyPort);
+  assert.equal((await f.model()).status, 200);
+});
+
+test('single-group startup cannot silently accept a group configured after clients started', async t => {
+  const f = await fixture(t); await f.start();
+  assert.deepEqual((await f.control('/register')).value.householdOptions, ['A']);
+  await configureGroups(f);
+  const rejected = await f.control('/egress-set', { name: 'account-a', household: 'B' });
+  assert.equal(rejected.status, 409); assert.equal(rejected.value.reason, 'egress_client_upgrade_required');
+  assert.equal(await readJson(path.join(f.profiles.A.root, 'egress-policy.json'), true), null);
+  assert.equal((await f.control('/select', { name: 'account-b' })).value.reason, 'egress_client_upgrade_required');
+  assert.equal((await registryState(f.config)).selected, 'account-a');
+  assert.equal((await f.model()).status, 200); assertOwner(f.calls.at(-1), 'A');
+});
+
+test('previously allocated scope ports stay available when all accounts return to one household', async t => {
+  const f = await fixture(t); const dependencies = await configureGroups(f); await f.start(dependencies);
+  const pinned = (await f.control('/register', { scope: 'account-b' })).value;
+  assert.equal((await f.control('/egress-set', { name: 'account-b', household: 'A' })).status, 200);
+  await f.service.close();
+  const file = path.join(f.config.serviceRoot, 'config', 'account-egress.json'), config = await readJson(file);
+  delete config.groups.B; await atomicJson(file, config);
+  await f.start(dependencies);
+  assert.deepEqual((await f.control('/status')).value.householdOptions, ['A']);
+  assert.equal((await f.control('/register', { scope: 'account-b' })).value.proxyPort, pinned.proxyPort);
+  assert.equal((await f.model('account-b', pinned.proxyPort)).status, 200);
+  assertOwner(f.calls.at(-1), 'B'); assert.equal(f.calls.at(-1).snapshot.egress.household, 'A');
+});
+
+for (const selected of ['account-a', 'account-b']) test(`dual-group startup with ${selected} does not require the other residential exit to be ready`, async t => {
+  const f = await fixture(t); await configureGroups(f);
+  await atomicJson(path.join(f.config.dataRoot, '..', 'state.json'), { version: 2, enabled: true, selected, selectedAt: 'fixture-initial' });
+  const checks = [];
+  await f.start({ network: async (config, options) => {
+    const group = config.serviceRoot === f.groupBRoot ? 'B' : 'A'; checks.push({ group, options });
+    if (group === 'A' && options.requireHouseReady !== false) throw new Error('house_service_not_ready');
+    return { proxy: `http://127.0.0.1:${group === 'B' ? 2 : 1}`, apiMode: 'official' };
+  } });
+  assert.equal(checks[0].group, 'A'); assert.equal(checks[0].options.requireHouseReady, false);
+  assert.deepEqual((await f.control('/register')).value.householdOptions, ['A', 'B']);
+  if (selected === 'account-a') {
+    assert.equal((await f.model()).status, 503); assert.equal(f.calls.length, 0);
+    assert.equal((await f.control('/select', { name: 'account-b' })).status, 200);
+  }
+  assert.equal((await f.model()).status, 200); assertOwner(f.calls.at(-1), 'B');
+  assert.equal(f.calls.at(-1).snapshot.egress.household, 'B');
+});
+
+for (const corrupt of ['default', 'duplicate', 'control', 'proxy']) test(`persisted scope proxy ports reject ${corrupt} collisions`, async t => {
+  const f = await fixture(t); await f.start(); await f.service.close();
+  const old = await readJson(path.join(runtimeRoot(f.config), 'service.json'));
+  const ports = corrupt === 'default' ? { default: 10001 } : corrupt === 'duplicate' ? { 'account-a': 10001, 'account-b': 10001 } :
+    { 'account-b': corrupt === 'control' ? old.controlPort : old.proxyPort };
+  await atomicJson(path.join(runtimeRoot(f.config), 'scope-proxy-ports.json'), { version: 1, ports });
+  await assert.rejects(f.start(), /runtime_unavailable/);
+});
 
 test('guarded select RPC preserves a newer manual selection and rejects malformed guards', async t => {
   const f = await fixture(t); await f.start();
@@ -241,6 +500,50 @@ test('default switching leaves explicitly pinned runtime scope and same session 
   assert.equal((await registryState(f.config)).selected, 'account-b');
 });
 
+test('new account scope can enroll while unbound and preserves shared default selection', async t => {
+  const f = await fixture(t, {}, { unboundProfiles: ['B'] });
+  t.mock.method(os, 'homedir', () => f.root);
+  const stateFile = path.join(f.config.dataRoot, '..', 'state.json');
+  const selectionBefore = await fs.readFile(stateFile);
+  const sourceBefore = await fs.readFile(globalConfigFile(f.profiles.B));
+  await f.start();
+  const scope = f.profiles.B.name;
+  const registered = await f.control('/register', { scope });
+  assert.equal(registered.status, 200);
+  assert.equal(registered.value.scope, scope);
+  const directory = registered.value.directory;
+  assert.notEqual(directory, runtimeDirectory(f.config));
+  assert.equal((await f.control('/status', { scope })).value.ready, false);
+  const callsBefore = f.accountCalls.length;
+  const ready = await f.control('/ready', { scope, name: scope });
+  assert.equal(ready.status, 409); assert.equal(ready.value.reason, 'login_required');
+  assert.equal((await f.model(scope)).status, 503);
+  assert.equal(f.accountCalls.length, callsBefore); assert.equal(f.calls.length, 0);
+  assert.equal((await getProfile(f.config, scope)).account, null);
+  assert.deepEqual(await fs.readFile(globalConfigFile(f.profiles.B)), sourceBefore);
+
+  const state = 'fixture-new-account-state', verifier = 'fixture-new-account-verifier';
+  const begun = await f.control('/login-begin', { scope, sessionId: 'fixture-new-account-session', oauthState: state,
+    oauthChallenge: createHash('sha256').update(verifier).digest('base64url') });
+  assert.equal(begun.status, 200);
+  const exchange = await f.request('/v1/oauth/token', { host: 'platform.claude.com', body: JSON.stringify({
+    grant_type: 'authorization_code', code: 'INVENTED-CODE', state, code_verifier: verifier,
+  }) });
+  assert.equal(exchange.status, 200);
+  f.values.set(directory, grant('B'));
+  assert.equal((await f.control('/login-finished', { scope })).status, 200);
+  const bound = await getProfile(f.config, scope);
+  assert.deepEqual(bound.account, { uuid: profile('B').account.uuid, email: profile('B').account.email });
+  assert.equal((await fs.readdir(f.config.dataRoot)).length, 2, 'enrollment reuses the fresh profile');
+  assert.equal((await f.control('/ready', { scope, name: scope })).status, 200);
+  assert.equal((await f.control('/status', { scope })).value.ready, true);
+  assert.equal(f.values.get(directory).claudeAiOauth.refreshToken, undefined);
+  assert.equal(f.values.get(bound.configDirectory).claudeAiOauth.refreshToken, 'INVENTED-B-REFRESH');
+  assert.deepEqual(await fs.readFile(stateFile), selectionBefore);
+  assert.equal((await f.model()).status, 200); assertOwner(f.calls.at(-1), 'A');
+  assert.equal((await f.model(scope)).status, 200); assertOwner(f.calls.at(-1), 'B');
+});
+
 test('daemon workers restore the private local channel from user settings and retain their own scope', async t => {
   const f = await fixture(t), sourceSettings = new Map();
   for (const p of Object.values(f.profiles))
@@ -333,6 +636,27 @@ test('restart preserves both native endpoints, channel key and certificate', asy
   assert.equal(current.certificateFingerprint, previous.certificateFingerprint); assert.equal(current.certFile, previous.certFile);
   assert.equal(f.key, key); assert.equal(f.certificate.cert.toString(), cert);
   assert.equal((await f.model()).status, 200); assert.equal((await f.control('/status')).value.ready, true);
+});
+
+test('service lock and descriptor share verified process generation and omit full command lines', async t => {
+  const f = await fixture(t), identity = { pid: process.pid, createdAt: 'fixture-service-birth',
+    executable: process.execPath, script: null };
+  let captures = 0;
+  await f.start({ getProcessIdentity: async () => { captures++; return { ...identity, commandLine: 'PRIVATE ARGV MUST NOT BE PERSISTED' }; } });
+  const lock = await readJson(path.join(runtimeRoot(f.config), 'service.lock'));
+  const descriptor = await readJson(path.join(runtimeRoot(f.config), 'service.json'));
+  assert.equal(captures, 1); assert.deepEqual(lock.processIdentity, identity);
+  assert.deepEqual(descriptor.processIdentity, identity);
+  assert.equal(lock.instanceId, descriptor.instanceId);
+  assert.doesNotMatch(JSON.stringify({ lock, descriptor }), /commandLine|PRIVATE ARGV/);
+  await f.service.coordinator.snapshot(); assert.equal(captures, 1);
+});
+
+test('unknown process generation prevents service ownership publication', async t => {
+  const f = await fixture(t);
+  await assert.rejects(f.start({ getProcessIdentity: async () => null }), /runtime_process_identity_unavailable/);
+  await assert.rejects(fs.stat(path.join(runtimeRoot(f.config), 'service.lock')), { code: 'ENOENT' });
+  await assert.rejects(fs.stat(path.join(runtimeRoot(f.config), 'service.json')), { code: 'ENOENT' });
 });
 
 for (const endpoint of ['proxyPort', 'controlPort']) test(`occupied persisted ${endpoint} fails closed without changing the saved endpoint`, async t => {
@@ -715,4 +1039,264 @@ test('certificate validation rejects a mismatched private key and a future valid
   const notBefore = new Date(new X509Certificate(first.cert).validFrom).getTime();
   t.mock.method(Date, 'now', () => notBefore - 1000);
   await assert.rejects(runtimeCertificate(firstDir), /runtime_certificate_expired/);
+});
+
+function expireFixtureAccount(f, label = 'B') {
+  const credentials = structuredClone(f.values.get(f.profiles[label].configDirectory));
+  credentials.claudeAiOauth.expiresAt = 0;
+  f.values.set(f.profiles[label].configDirectory, credentials);
+  return credentials;
+}
+function capturedRefresh(f) {
+  const saved = f.writes.find(value => value.directory.includes('pending-logins') && value.value.recoveredCredentials);
+  assert(saved, 'rotation is captured in an independent OAuth item');
+  return saved;
+}
+
+for (const mismatch of ['account', 'organization']) test(`refresh recovery rejects a different ${mismatch} without importing or acknowledging it`, async t => {
+  const refreshTokens = [];
+  const f = await fixture(t, { requestAccount: async (_, kind, options) => {
+    if (kind === 'refresh') {
+      refreshTokens.push(options.body.refresh_token);
+      const label = mismatch === 'account' ? 'A' : 'B';
+      return { access_token: `INVENTED-${label}-ACCESS-NEW`, refresh_token: `INVENTED-${label}-REFRESH-NEW`,
+        expires_in: 3600, ...(mismatch === 'account' ? { account: { uuid: profile('A').account.uuid } } : {}) };
+    }
+    const remote = profile(options.token.includes('-B-') ? 'B' : 'A');
+    if (mismatch === 'organization' && options.token === 'INVENTED-B-ACCESS-NEW')
+      remote.organization = profile('A').organization;
+    return remote;
+  } });
+  await f.start();
+  const originalA = structuredClone(f.values.get(f.profiles.A.configDirectory));
+  const originalB = expireFixtureAccount(f);
+  const originalIdentityB = await readJson(globalConfigFile(f.profiles.B));
+  const originalProfileB = await readJson(path.join(f.profiles.B.root, 'profile.json'));
+  const refreshed = await f.control('/ready', { name: 'account-b' });
+  assert.equal(refreshed.status, 409); assert.equal(refreshed.value.reason, 'wrong_account');
+  const pending = capturedRefresh(f);
+  assert.equal((await readJson(path.join(pending.directory, 'record.json'))).acknowledgedAt, undefined);
+  assert.deepEqual(f.values.get(f.profiles.A.configDirectory), originalA);
+  if (mismatch === 'account') assert.deepEqual(f.values.get(f.profiles.B.configDirectory), originalB);
+  assert.equal((await f.control('/ready', { name: 'account-b' })).value.reason, 'auth_renewal_failed');
+  await f.service.close(); await f.start();
+  assert.deepEqual(refreshTokens, ['INVENTED-B-REFRESH'], 'recovery verifies the captured grant without consuming the old RT again');
+  assert.equal((await readJson(path.join(runtimeRoot(f.config), 'last-recovery-error.json'))).reason, 'wrong_account');
+  assert.equal((await readJson(path.join(pending.directory, 'record.json'))).acknowledgedAt, undefined);
+  assert.deepEqual(f.values.get(pending.directory), pending.value);
+  assert.deepEqual(f.values.get(f.profiles.A.configDirectory), originalA);
+  assert.deepEqual(await readJson(globalConfigFile(f.profiles.B)), originalIdentityB);
+  assert.deepEqual(await readJson(path.join(f.profiles.B.root, 'profile.json')), originalProfileB);
+  assert.equal((await registryState(f.config)).selected, 'account-a');
+  assert.equal((await f.control('/ready', { name: 'account-b' })).value.reason, 'auth_renewal_failed');
+});
+
+test('a refresh receipt installed before profile 429 cannot acknowledge or bypass the persisted wait on restart', async t => {
+  let limited = true, profileAttempts = 0;
+  const refreshTokens = [], retryAt = Date.now() + 3_600_000;
+  const f = await fixture(t, { requestAccount: async (_, kind, options) => {
+    if (kind === 'refresh') {
+      refreshTokens.push(options.body.refresh_token);
+      return { access_token: 'INVENTED-B-ACCESS-NEW', refresh_token: 'INVENTED-B-REFRESH-NEW', expires_in: 3600 };
+    }
+    if (options.token === 'INVENTED-B-ACCESS-NEW') {
+      profileAttempts++;
+      if (limited) throw Object.assign(new Error('auth_rate_limited'), { status: 429, retryAt });
+    }
+    return profile(options.token.includes('-B-') ? 'B' : 'A');
+  } });
+  await f.start(); expireFixtureAccount(f);
+  const ready = await f.control('/ready', { name: 'account-b' });
+  assert.equal(ready.status, 409); assert.equal(ready.value.reason, 'auth_rate_limited');
+  const pending = capturedRefresh(f), recordPath = path.join(pending.directory, 'record.json');
+  const record = await readJson(recordPath);
+  assert.equal(f.values.get(f.profiles.B.configDirectory).ccpickRuntimeGrant.id, record.id,
+    'the vault receipt exists even though official verification has not succeeded');
+  const waitPath = path.join(f.profiles.B.root, 'auth-backoff.json'), wait = await readJson(waitPath);
+  assert(wait.retryAt >= retryAt);
+  await f.service.close(); await f.start();
+  assert.equal(profileAttempts, 1, 'restart observes the account wait before issuing another identity query');
+  assert.deepEqual(refreshTokens, ['INVENTED-B-REFRESH']);
+  assert.equal((await readJson(recordPath)).acknowledgedAt, undefined);
+  assert.deepEqual(f.values.get(pending.directory), pending.value);
+  assert.deepEqual(await readJson(waitPath), wait);
+  assert.equal((await f.control('/ready', { name: 'account-b' })).value.reason, 'auth_renewal_failed');
+  await f.service.close(); limited = false;
+  await atomicJson(waitPath, { version: 1, retryAt: 0 });
+  await f.start();
+  assert.equal(profileAttempts, 2, 'the existing receipt still requires official verification after the wait');
+  assert.deepEqual(refreshTokens, ['INVENTED-B-REFRESH']);
+  assert((await readJson(recordPath)).acknowledgedAt);
+  assert.deepEqual(f.values.get(pending.directory), {});
+  assert.equal((await f.control('/ready', { name: 'account-b' })).status, 200);
+  assert.equal((await registryState(f.config)).selected, 'account-a');
+});
+
+for (const failure of ['journal-file', 'journal-store']) test(`a ${failure} write failure retains a rotation in memory and blocks old RT reuse until recovery`, async t => {
+  const f = await fixture(t, { recoveryDelayMs: 0, recoveryRetryMs: 20 });
+  await f.start(); expireFixtureAccount(f);
+  let refuse = true;
+  if (failure === 'journal-file') {
+    const writeFile = fs.writeFile;
+    t.mock.method(fs, 'writeFile', async (file, ...args) => {
+      if (refuse && String(file).startsWith(path.join(runtimeRoot(f.config), 'pending-logins') + path.sep) &&
+          path.basename(String(file)).startsWith('record.json.'))
+        throw Object.assign(new Error('fixture_record_busy'), { code: 'EBUSY' });
+      return writeFile(file, ...args);
+    });
+  } else {
+    const write = f.store.write;
+    f.store.write = async (directory, value) => {
+      if (refuse && directory.includes('pending-logins') && value.recoveredCredentials)
+        throw new Error('fixture_secure_store_busy');
+      return write(directory, value);
+    };
+  }
+  assert.equal((await f.control('/ready', { name: 'account-b' })).status, 409);
+  assert.equal((await f.control('/ready', { name: 'account-b' })).value.reason, 'auth_renewal_failed');
+  assert.deepEqual(f.accountCalls.filter(value => value.kind === 'refresh').map(value => value.options.body.refresh_token),
+    ['INVENTED-B-REFRESH']);
+  assert.equal(f.values.get(f.profiles.B.configDirectory).claudeAiOauth.refreshToken, 'INVENTED-B-REFRESH');
+  refuse = false;
+  await until(() => f.values.get(f.profiles.B.configDirectory).claudeAiOauth.refreshToken === 'INVENTED-B-REFRESH-NEW');
+  await until(async () => (await f.control('/ready', { name: 'account-b' })).status === 200);
+  const directory = path.join(runtimeRoot(f.config), 'pending-logins',
+    (await fs.readdir(path.join(runtimeRoot(f.config), 'pending-logins')))[0]);
+  assert((await readJson(path.join(directory, 'record.json'))).acknowledgedAt);
+  assert.deepEqual(f.values.get(directory), {});
+  await f.service.close(); await f.start();
+  assert.equal((await f.control('/ready', { name: 'account-b' })).status, 200);
+  assert.deepEqual(f.accountCalls.filter(value => value.kind === 'refresh').map(value => value.options.body.refresh_token),
+    ['INVENTED-B-REFRESH'], 'same-service retries and restart both retain the rotated RT');
+  assert.equal((await registryState(f.config)).selected, 'account-a');
+});
+
+test('a target vault write failure recovers the durable refresh journal after restart without using the old RT', async t => {
+  const f = await fixture(t); await f.start();
+  const oldB = expireFixtureAccount(f), originalWrite = f.store.write;
+  f.store.write = async (directory, value) => {
+    if (directory === f.profiles.B.configDirectory && value.claudeAiOauth?.refreshToken === 'INVENTED-B-REFRESH-NEW')
+      throw new Error('fixture_vault_busy');
+    return originalWrite(directory, value);
+  };
+  assert.equal((await f.control('/ready', { name: 'account-b' })).status, 409);
+  const pending = capturedRefresh(f), recordPath = path.join(pending.directory, 'record.json');
+  assert.deepEqual(f.values.get(f.profiles.B.configDirectory), oldB);
+  assert.equal((await readJson(recordPath)).acknowledgedAt, undefined);
+  assert.equal((await f.control('/ready', { name: 'account-b' })).value.reason, 'auth_renewal_failed');
+  await f.service.close(); f.store.write = originalWrite; await f.start();
+  assert.equal(f.values.get(f.profiles.B.configDirectory).claudeAiOauth.refreshToken, 'INVENTED-B-REFRESH-NEW');
+  assert((await readJson(recordPath)).acknowledgedAt);
+  assert.deepEqual(f.values.get(pending.directory), {});
+  assert.equal((await f.control('/ready', { name: 'account-b' })).status, 200);
+  assert.deepEqual(f.accountCalls.filter(value => value.kind === 'refresh').map(value => value.options.body.refresh_token),
+    ['INVENTED-B-REFRESH']);
+  assert.equal((await registryState(f.config)).selected, 'account-a');
+});
+
+for (const failure of ['none', 'target-vault', 'journal-store']) test(`an expired matching refresh receipt commits its newly rotated grant before acknowledging recovery (${failure})`, async t => {
+  let failProfile = true, refuseRecoveryWrite = false;
+  const refreshTokens = [];
+  const f = await fixture(t, { recoveryRetryMs: 20, requestAccount: async (_, kind, options) => {
+    if (kind === 'refresh') {
+      refreshTokens.push(options.body.refresh_token);
+      assert.equal(refreshTokens.length <= 2, true, 'an acknowledged recovery cannot reuse the consumed RT');
+      const suffix = refreshTokens.length === 1 ? 'NEW' : 'LATEST';
+      return { access_token: `INVENTED-B-ACCESS-${suffix}`, refresh_token: `INVENTED-B-REFRESH-${suffix}`, expires_in: 3600 };
+    }
+    if (failProfile && options.token === 'INVENTED-B-ACCESS-NEW') throw new Error('network_unavailable');
+    return profile(options.token.includes('-B-') ? 'B' : 'A');
+  } });
+  await f.start(); expireFixtureAccount(f);
+  assert.equal((await f.control('/ready', { name: 'account-b' })).status, 409);
+  const pending = capturedRefresh(f), recordPath = path.join(pending.directory, 'record.json');
+  const receipt = (await readJson(recordPath)).id;
+  assert.equal(f.values.get(f.profiles.B.configDirectory).ccpickRuntimeGrant.id, receipt);
+  await f.service.close(); expireFixtureAccount(f); failProfile = false;
+  const originalWrite = f.store.write;
+  f.store.write = async (directory, value) => {
+    if (refuseRecoveryWrite && ((failure === 'target-vault' && directory === f.profiles.B.configDirectory &&
+        value.claudeAiOauth?.refreshToken === 'INVENTED-B-REFRESH-LATEST') ||
+        (failure === 'journal-store' && directory === pending.directory &&
+        value.recoveredCredentials?.claudeAiOauth?.refreshToken === 'INVENTED-B-REFRESH-LATEST')))
+      throw new Error('fixture_recovery_write_busy');
+    return originalWrite(directory, value);
+  };
+  refuseRecoveryWrite = failure !== 'none';
+  await f.start();
+  assert.deepEqual(refreshTokens, ['INVENTED-B-REFRESH', 'INVENTED-B-REFRESH-NEW']);
+  if (failure !== 'none') {
+    assert.equal(f.values.get(f.profiles.B.configDirectory).claudeAiOauth.refreshToken, 'INVENTED-B-REFRESH-NEW');
+    assert.equal((await readJson(recordPath)).acknowledgedAt, undefined);
+    assert.equal((await f.control('/ready', { name: 'account-b' })).value.reason, 'auth_renewal_failed');
+    if (failure === 'target-vault') {
+      assert.equal(f.values.get(pending.directory).recoveredCredentials.claudeAiOauth.refreshToken, 'INVENTED-B-REFRESH-LATEST');
+      await f.service.close(); refuseRecoveryWrite = false; await f.start();
+    } else {
+      refuseRecoveryWrite = false;
+      await until(async () => (await readJson(recordPath)).acknowledgedAt);
+    }
+    assert.deepEqual(refreshTokens, ['INVENTED-B-REFRESH', 'INVENTED-B-REFRESH-NEW'],
+      'another recovery uses the saved new grant rather than refreshing the consumed vault RT');
+  }
+  assert.equal(f.values.get(f.profiles.B.configDirectory).claudeAiOauth.refreshToken, 'INVENTED-B-REFRESH-LATEST');
+  assert.equal(f.values.get(f.profiles.B.configDirectory).claudeAiOauth.accessToken, 'INVENTED-B-ACCESS-LATEST');
+  assert((await readJson(recordPath)).acknowledgedAt);
+  assert.deepEqual(f.values.get(pending.directory), {});
+  assert.equal((await f.control('/ready', { name: 'account-b' })).status, 200);
+  assert.equal(refreshTokens.length, 2);
+  assert.equal((await registryState(f.config)).selected, 'account-a');
+});
+
+for (const restart of [false, true]) test(`a pending refresh of the selected account keeps the service and login entry available (restart=${restart})`, async t => {
+  const refreshTokens = [];
+  const f = await fixture(t, { requestAccount: async (_, kind, options) => {
+    if (kind === 'refresh') {
+      refreshTokens.push(options.body.refresh_token);
+      return { access_token: 'INVENTED-A-ACCESS-NEW', refresh_token: 'INVENTED-A-REFRESH-NEW', expires_in: 3600 };
+    }
+    if (options.token === 'INVENTED-A-ACCESS-NEW') throw new Error('network_unavailable');
+    return profile(options.token.includes('-B-') ? 'B' : 'A');
+  } });
+  expireFixtureAccount(f, 'A'); await f.start();
+  const pending = capturedRefresh(f);
+  if (restart) { await f.service.close(); await f.start(); }
+  assert.equal((await f.control('/status')).value.ready, false);
+  assert.equal((await f.model()).status, 503);
+  const begun = await f.control('/login-begin', { sessionId: 'fixture-session', oauthState: 'fixture-state',
+    oauthChallenge: createHash('sha256').update('fixture-verifier').digest('base64url') });
+  assert.equal(begun.status, 200, 'the durable unresolved rotation must not prevent explicit reauthorization');
+  assert.deepEqual(refreshTokens, ['INVENTED-A-REFRESH']);
+  assert.equal((await readJson(path.join(pending.directory, 'record.json'))).acknowledgedAt, undefined);
+  assert.equal((await registryState(f.config)).selected, 'account-a');
+});
+
+test('a later verified login supersedes an unresolved refresh without requiring the revoked old grant', async t => {
+  const refreshTokens = [];
+  const f = await fixture(t, { requestAccount: async (_, kind, options) => {
+    if (kind === 'login') return { access_token: 'INVENTED-B-ACCESS-LATEST', refresh_token: 'INVENTED-B-REFRESH-LATEST', expires_in: 3600 };
+    if (kind === 'refresh') {
+      refreshTokens.push(options.body.refresh_token);
+      return { access_token: 'INVENTED-B-ACCESS-NEW', refresh_token: 'INVENTED-B-REFRESH-NEW', expires_in: 3600 };
+    }
+    if (options.token === 'INVENTED-B-ACCESS-NEW') throw new Error('login_required');
+    return profile(options.token.includes('-B-') ? 'B' : 'A');
+  } });
+  await f.start(); expireFixtureAccount(f);
+  assert.equal((await f.control('/ready', { name: 'account-b' })).status, 409);
+  const pending = capturedRefresh(f), recordPath = path.join(pending.directory, 'record.json');
+  assert.equal((await exchangeLogin(f)).status, 200);
+  const latest = grant('B'); latest.claudeAiOauth.accessToken = 'INVENTED-B-ACCESS-LATEST';
+  latest.claudeAiOauth.refreshToken = 'INVENTED-B-REFRESH-LATEST';
+  f.values.set(runtimeDirectory(f.config), latest);
+  const finished = await f.control('/login-finished');
+  assert.equal(finished.status, 200, 'a verified later login must make the selected account available');
+  assert.equal(f.values.get(f.profiles.B.configDirectory).claudeAiOauth.refreshToken, 'INVENTED-B-REFRESH-LATEST');
+  assert((await readJson(recordPath)).acknowledgedAt, 'the superseded refresh no longer blocks account loads');
+  assert.deepEqual(f.values.get(pending.directory), {});
+  assert.equal((await f.control('/ready', { name: 'account-b' })).status, 200);
+  await f.service.close(); await f.start();
+  assert.equal((await f.model()).status, 200); assertOwner(f.calls.at(-1), 'B');
+  assert.deepEqual(refreshTokens, ['INVENTED-B-REFRESH']);
+  assert.equal((await registryState(f.config)).selected, 'account-b');
 });
